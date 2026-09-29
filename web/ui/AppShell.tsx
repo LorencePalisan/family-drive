@@ -9,7 +9,7 @@ import { applyTheme, type Theme } from "../lib/theme";
 import type { Me } from "../lib/types";
 import { formatBytes } from "../lib/format";
 import { enqueue, filesFromDrop, onUploadFinished, uploadWithPaths } from "../lib/upload";
-import { Avatar, IconButton, useToast } from "./primitives";
+import { Avatar, IconButton, Logo, useToast } from "./primitives";
 import { useDriveUI } from "./DriveUI";
 import { DetailsPanel } from "./DetailsPanel";
 import { UploadTray } from "./UploadTray";
@@ -324,7 +324,7 @@ export function AppShell() {
           <Menu size={22} />
         </IconButton>
         <NavLink to="/" className="flex shrink-0 items-center gap-2 pr-4 max-sm:hidden lg:w-[232px]">
-          <img src="/favicon.svg" alt="" className="size-9" />
+          <Logo className="size-9" />
           <span className="text-[22px] text-fg-2">{me.data?.appName ?? "Drive"}</span>
         </NavLink>
         <SearchBar />

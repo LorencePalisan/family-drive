@@ -30,9 +30,14 @@ export async function touchRecent(env: Env, userId: string, fileId: string, acti
     .run();
 }
 
+/** A person's storage limit: the one the owner set for them, or the default. */
+export const quotaFor = (env: Env, storageQuota: number | null | undefined) => storageQuota ?? Number(env.STORAGE_QUOTA_BYTES);
+
 export async function assertQuota(env: Env, userId: string, extraBytes: number) {
-  const row = await env.DB.prepare("SELECT storage_used FROM users WHERE id = ?").bind(userId).first<{ storage_used: number }>();
-  if ((row?.storage_used ?? 0) + extraBytes > Number(env.STORAGE_QUOTA_BYTES)) fail(413, "Not enough storage left");
+  const row = await env.DB.prepare("SELECT storage_used, storage_quota FROM users WHERE id = ?")
+    .bind(userId)
+    .first<{ storage_used: number; storage_quota: number | null }>();
+  if ((row?.storage_used ?? 0) + extraBytes > quotaFor(env, row?.storage_quota)) fail(413, "Not enough storage left");
 }
 
 // mime-type filters for search, matching the Drive "Type" chip.

@@ -9,6 +9,7 @@ export const users = sqliteTable("users", {
   avatarUrl: text("avatar_url"),
   role: text("role", { enum: ["owner", "member"] }).notNull().default("member"),
   storageUsed: integer("storage_used").notNull().default(0),
+  storageQuota: integer("storage_quota"), // bytes; null = the STORAGE_QUOTA_BYTES default
   theme: text("theme", { enum: ["system", "light", "dark"] }).notNull().default("system"),
   createdAt: integer("created_at").notNull(),
 });
