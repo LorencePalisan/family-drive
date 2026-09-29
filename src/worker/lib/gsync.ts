@@ -20,6 +20,12 @@ import { fileKey, thumbKey } from "./storage";
 import { notify } from "./notify";
 import { cleanName, quotaFor } from "../routes/files";
 
+/**
+ * Google Drive sync is switched off for now (no API routes, no background runs). To bring it back, set this to true
+ * together with GOOGLE_SYNC_ENABLED in web/lib/features.ts and re-add the "* * * * *" cron in wrangler.jsonc.
+ */
+export const GSYNC_ENABLED = false;
+
 /** Limits sized for the free plans. On Workers Paid + D1 paid these can be raised a lot (1000 requests/queries per run). */
 export const SYNC_LIMITS = {
   fetches: 40, // Google requests per run (Workers Free: 50 subrequests per invocation)

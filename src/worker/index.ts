@@ -12,7 +12,7 @@ import invites from "./routes/invites";
 import notifications from "./routes/notifications";
 import google from "./routes/google";
 import gsync from "./routes/gsync";
-import { gsyncHousekeeping, runSync } from "./lib/gsync";
+import { GSYNC_ENABLED, gsyncHousekeeping, runSync } from "./lib/gsync";
 
 const app = new Hono<AppEnv>();
 
@@ -44,7 +44,7 @@ api.route("/", files);
 api.route("/", uploads);
 api.route("/", sharing);
 api.route("/", google);
-api.route("/", gsync);
+if (GSYNC_ENABLED) api.route("/", gsync);
 api.route("/notifications", notifications);
 api.route("/invites", invites);
 app.route("/api", api);
@@ -59,7 +59,7 @@ export default {
 
   async scheduled(event, env) {
     // Every minute: copy the next batch of Google Drive sync work. Leases in runSync keep overlapping runs apart.
-    if (event.cron !== HOUSEKEEPING_CRON) return runSync(env, { ms: 50_000 });
+    if (event.cron !== HOUSEKEEPING_CRON) return GSYNC_ENABLED ? runSync(env, { ms: 50_000 }) : undefined;
     await housekeeping(env);
   },
 } satisfies ExportedHandler<Env>;
@@ -91,6 +91,6 @@ async function housekeeping(env: Env) {
           WHERE rn > 500)`,
     ),
   ]);
-  await gsyncHousekeeping(env);
+  if (GSYNC_ENABLED) await gsyncHousekeeping(env);
   console.log(`cleanup: purged ${old.length} trashed items, aborted ${stale.length} uploads`);
 }

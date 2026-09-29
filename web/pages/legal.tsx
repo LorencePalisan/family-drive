@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { Link } from "react-router";
 import { ArrowLeft } from "lucide-react";
 import { Logo } from "../ui/primitives";
+import { GOOGLE_SYNC_ENABLED } from "../lib/features";
 
 const EFFECTIVE = "September 28, 2026";
 const CONTACT = "lorencepalisan@gmail.com";
@@ -74,16 +75,20 @@ export function PrivacyPage() {
         if you ask, to bring your edited version back. You can disconnect this at any time from your profile menu, or
         in your Google Account's security settings.
       </p>
-      <h2>Google Drive sync</h2>
-      <p>
-        If you turn on <b>Google Drive sync</b>, the site also asks for read-only access to your Google Drive (the{" "}
-        <code>drive.readonly</code> scope). It uses this only to list the folders you can choose from and to copy the
-        folders you picked (and later changes to them) into your own Family Drive storage. It never changes or deletes
-        anything in your Google Drive. To notice changes, it checks the list of recently changed files in your Google
-        Drive; changes outside the folders you chose are ignored and not stored. Stop syncing a
-        folder from the Google Drive sync page, or disconnect Google Drive from your profile menu at any time. Files
-        already copied stay in Family Drive until you delete them.
-      </p>
+      {GOOGLE_SYNC_ENABLED && (
+        <>
+          <h2>Google Drive sync</h2>
+          <p>
+            If you turn on <b>Google Drive sync</b>, the site also asks for read-only access to your Google Drive (the{" "}
+            <code>drive.readonly</code> scope). It uses this only to list the folders you can choose from and to copy the
+            folders you picked (and later changes to them) into your own Family Drive storage. It never changes or deletes
+            anything in your Google Drive. To notice changes, it checks the list of recently changed files in your Google
+            Drive; changes outside the folders you chose are ignored and not stored. Stop syncing a
+            folder from the Google Drive sync page, or disconnect Google Drive from your profile menu at any time. Files
+            already copied stay in Family Drive until you delete them.
+          </p>
+        </>
+      )}
       <p>
         Family Drive's use and transfer of information received from Google APIs will adhere to the{" "}
         <a href="https://developers.google.com/terms/api-services-user-data-policy" target="_blank" rel="noreferrer">

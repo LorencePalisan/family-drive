@@ -76,6 +76,11 @@ const env = {
 } as Env;
 const { default: worker } = await import(`${ROOT}/src/worker/index.ts`);
 const gs = await import(`${ROOT}/src/worker/lib/gsync.ts`);
+if (!gs.GSYNC_ENABLED) {
+  console.log("Google Drive sync is switched off (GSYNC_ENABLED = false in src/worker/lib/gsync.ts); skipping.");
+  await dispose();
+  process.exit(0);
+}
 const { encrypt } = await import(`${ROOT}/src/worker/lib/crypto.ts`);
 const { purgeFiles } = await import(`${ROOT}/src/worker/lib/storage.ts`);
 

@@ -11,6 +11,7 @@ import { FolderPage, HomePage, MyDrivePage, NotFoundPage, RecentPage, SearchPage
 import { FamilyPage, FileLinkPage, LoginPage, PublicSharePage } from "./pages/other";
 import { PrivacyPage, TermsPage } from "./pages/legal";
 import { GoogleSyncPage } from "./pages/gsync";
+import { GOOGLE_SYNC_ENABLED } from "./lib/features";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -44,7 +45,7 @@ createRoot(document.getElementById("root")!).render(
                 <Route path="trash" element={<TrashPage />} />
                 <Route path="search" element={<SearchPage />} />
                 <Route path="family" element={<FamilyPage />} />
-                <Route path="google-sync" element={<GoogleSyncPage />} />
+                {GOOGLE_SYNC_ENABLED && <Route path="google-sync" element={<GoogleSyncPage />} />}
                 <Route path="*" element={<NotFoundPage />} />
               </Route>
             </Routes>

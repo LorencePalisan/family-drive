@@ -26,8 +26,8 @@
 		}
 	],
 	"r2_buckets": [{ "binding": "BUCKET", "bucket_name": "family-drive-files" }],
-	// 03:00 daily housekeeping; every minute for Google Drive sync batches.
-	"triggers": { "crons": ["0 3 * * *", "* * * * *"] },
+	// 03:00 daily housekeeping. (Google Drive sync, when enabled, also needs "* * * * *".)
+	"triggers": { "crons": ["0 3 * * *"] },
 	/**
 	 * Non-secret config. Secrets (set with `wrangler secret put`, and in .dev.vars locally):
 	 * GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, TOKEN_ENC_KEY, RESEND_API_KEY

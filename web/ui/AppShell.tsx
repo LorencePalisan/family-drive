@@ -15,6 +15,7 @@ import { DetailsPanel } from "./DetailsPanel";
 import { UploadTray } from "./UploadTray";
 import { NotificationsMenu } from "./Notifications";
 import { useMe } from "./useMe";
+import { GOOGLE_SYNC_ENABLED } from "../lib/features";
 import { LegalLinks } from "../pages/legal";
 
 const GOOGLE_ERRORS: Record<string, string> = {
@@ -109,7 +110,7 @@ function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
       {link("/starred", Star, "Starred")}
       <div className="h-3" />
       {link("/trash", Trash2, "Trash")}
-      {link("/google-sync", RefreshCw, "Google Drive sync")}
+      {GOOGLE_SYNC_ENABLED && link("/google-sync", RefreshCw, "Google Drive sync")}
       {me?.role === "owner" && link("/family", UsersRound, "Manage family")}
       <div className="flex h-8 items-center gap-4 pl-4 text-sm">
         <Cloud size={20} /> Storage
