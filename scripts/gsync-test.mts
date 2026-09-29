@@ -19,8 +19,53 @@ const buffered = async (v: unknown) => (v instanceof ReadableStream ? await new 
 const wrapUpload = (u: R2MultipartUpload) =>
   Object.assign(Object.create(u), { uploadId: u.uploadId, key: u.key, uploadPart: async (n: number, v: unknown) => u.uploadPart(n, (await buffered(v)) as ArrayBuffer), complete: (p: R2UploadedPart[]) => u.complete(p), abort: () => u.abort() });
 const bucket = proxy.env.BUCKET;
+// Count D1 queries and rows read per run (Workers Free: 50 queries per invocation; D1 bills rows read).
+let queries = 0;
+let rowsRead = 0;
+const real = new WeakMap<object, D1PreparedStatement>();
+const counted = (st: D1PreparedStatement): D1PreparedStatement => {
+  const wrapped = {
+    bind: (...a: unknown[]) => counted(st.bind(...a)),
+    all: async () => {
+      queries++;
+      const r = await st.all();
+      rowsRead += r.meta.rows_read ?? 0;
+      return r;
+    },
+    run: async () => {
+      queries++;
+      const r = await st.run();
+      rowsRead += r.meta.rows_read ?? 0;
+      return r;
+    },
+    first: async (col?: string) => {
+      queries++;
+      const r = await st.all<Record<string, unknown>>();
+      rowsRead += r.meta.rows_read ?? 0;
+      const row = r.results[0] ?? null;
+      return col ? (row?.[col] ?? null) : row;
+    },
+    raw: (...a: any[]) => (queries++, (st as any).raw(...a)),
+  } as unknown as D1PreparedStatement;
+  real.set(wrapped, st);
+  return wrapped;
+};
+const db = proxy.env.DB;
+const DB = {
+  prepare: (q: string) => counted(db.prepare(q)),
+  batch: async (list: D1PreparedStatement[]) => {
+    queries += list.length;
+    const r = await db.batch(list.map((x) => real.get(x) ?? x));
+    for (const x of r) rowsRead += x.meta.rows_read ?? 0;
+    return r;
+  },
+  exec: db.exec.bind(db),
+  dump: () => db.dump(),
+  withSession: db.withSession?.bind(db),
+} as unknown as D1Database;
 const env = {
   ...proxy.env,
+  DB,
   BUCKET: Object.assign(Object.create(bucket), {
     get: bucket.get.bind(bucket),
     delete: bucket.delete.bind(bucket),
@@ -128,6 +173,7 @@ await env.DB.batch([
   env.DB.prepare("DELETE FROM gsync_items WHERE user_id = ?").bind(owner.id),
   env.DB.prepare("DELETE FROM gsync_sources WHERE user_id = ?").bind(owner.id),
   env.DB.prepare("DELETE FROM gsync_users WHERE user_id = ?").bind(owner.id),
+  env.DB.prepare("DELETE FROM gsync_daily"),
 ]);
 const BIG = new Uint8Array(12 * 1024 * 1024).map((_, i) => i % 251);
 put({ id: "ROOT", name: "My Drive", mimeType: FOLDER, parents: [] }, true);
@@ -159,11 +205,21 @@ gs.SYNC_LIMITS.partSize = 5 * 1024 * 1024;
 gs.SYNC_LIMITS.changesEveryMs = 0;
 gs.SYNC_LIMITS.fetches = 8; // small, so the big file must resume across runs
 let maxCallsPerRun = 0;
+let maxQueriesPerRun = 0;
+let maxRowsPerRun = 0;
+async function measuredRun(opts: { userId?: string; force?: boolean } = { userId: owner.id }) {
+  googleCalls = 0;
+  queries = 0;
+  rowsRead = 0;
+  await gs.runSync(env, opts);
+  maxCallsPerRun = Math.max(maxCallsPerRun, googleCalls);
+  maxQueriesPerRun = Math.max(maxQueriesPerRun, queries);
+  maxRowsPerRun = Math.max(maxRowsPerRun, rowsRead);
+  return { calls: googleCalls, queries, rows: rowsRead };
+}
 async function syncUntilIdle(max = 60) {
   for (let i = 0; i < max; i++) {
-    googleCalls = 0;
-    await gs.runSync(env, { userId: owner.id });
-    maxCallsPerRun = Math.max(maxCallsPerRun, googleCalls);
+    await measuredRun();
     const p = await env.DB.prepare("SELECT COUNT(*) AS n FROM gsync_items i JOIN gsync_sources s ON s.id = i.source_id WHERE i.user_id = ? AND i.state = 'pending' AND s.status = 'active' AND i.retry_at <= ?")
       .bind(owner.id, Date.now())
       .first<{ n: number }>();
@@ -177,6 +233,25 @@ const content = async (fileId: string) => {
   const f = await env.DB.prepare("SELECT v.r2_key FROM files f JOIN file_versions v ON v.id = f.current_version_id WHERE f.id = ?").bind(fileId).first<{ r2_key: string }>();
   return new Uint8Array(await (await env.BUCKET.get(f!.r2_key))!.arrayBuffer());
 };
+async function countersMatch(label: string) {
+  const { results } = await env.DB.prepare(
+    `SELECT s.id, s.n_pending, s.n_done, s.n_skipped, s.n_error, s.bytes_done, s.folders_pending,
+            (SELECT COUNT(*) FROM gsync_items i WHERE i.source_id = s.id AND i.kind = 'file' AND i.state = 'pending') AS c_pending,
+            (SELECT COUNT(*) FROM gsync_items i WHERE i.source_id = s.id AND i.kind = 'file' AND i.state = 'done') AS c_done,
+            (SELECT COUNT(*) FROM gsync_items i WHERE i.source_id = s.id AND i.kind = 'file' AND i.state = 'skipped') AS c_skipped,
+            (SELECT COUNT(*) FROM gsync_items i WHERE i.source_id = s.id AND i.state = 'error') AS c_error,
+            (SELECT COALESCE(SUM(size), 0) FROM gsync_items i WHERE i.source_id = s.id AND i.kind = 'file' AND i.state = 'done') AS c_bytes,
+            (SELECT COUNT(*) FROM gsync_items i WHERE i.source_id = s.id AND i.kind = 'folder' AND i.state = 'pending') AS c_folders
+       FROM gsync_sources s WHERE s.user_id = ?`,
+  )
+    .bind(owner.id)
+    .all<any>();
+  const bad = results.filter(
+    (r) => r.n_pending !== r.c_pending || r.n_done !== r.c_done || r.n_skipped !== r.c_skipped || r.n_error !== r.c_error || r.bytes_done !== r.c_bytes || r.folders_pending !== r.c_folders,
+  );
+  if (bad.length) console.log(JSON.stringify(bad));
+  ok(!bad.length, `progress counters match a full recount (${label})`);
+}
 const eq = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
 
 let sourceId = "";
@@ -196,6 +271,14 @@ try {
   ok((await call("/api/gsync/sources", { method: "POST", body: JSON.stringify({ googleFolderId: "SUB" }) })).status === 409, "a folder that's already syncing (nested) is rejected");
   ok(runs > 1, `first sync finished in ${runs} runs (resumes across runs)`);
   ok(maxCallsPerRun <= gs.SYNC_LIMITS.fetches, `never more than ${gs.SYNC_LIMITS.fetches} Google requests per run (max ${maxCallsPerRun})`);
+  await countersMatch("after first copy");
+  // Idle: nothing pending and changes checked just now → the cron minute is nearly free.
+  gs.SYNC_LIMITS.changesEveryMs = 5 * 60_000;
+  const idle = await measuredRun({});
+  ok(idle.calls === 0 && idle.queries <= 3 && idle.rows <= 20, `idle minute: ${idle.queries} queries, ${idle.rows} rows read, ${idle.calls} Google calls`);
+  gs.SYNC_LIMITS.changesEveryMs = 0;
+  const check = await measuredRun({});
+  ok(check.calls <= 2, `changes check with a cached token: ${check.calls} Google call(s), ${check.queries} queries, ${check.rows} rows`);
 
   const destRow = await env.DB.prepare("SELECT name, parent_id FROM files WHERE id = ?").bind(dest).first<any>();
   ok(destRow.name === "Google Drive · Photos" && destRow.parent_id === null, "destination folder in My Files");
@@ -243,6 +326,8 @@ try {
   ok(!(await env.DB.prepare("SELECT 1 FROM gsync_items WHERE google_id = 'o'").first()), "changes outside synced folders are ignored");
   ok((await child(dest, "c.jpg"))?.trashed_at === null, "trashing in Google does not delete here");
 
+  await countersMatch("after changes");
+
   // 4. Removed in Family Drive is never re-added
   const d = await child(sub.id, "d.txt");
   await env.DB.prepare("UPDATE files SET trashed_at = ? WHERE id = ?").bind(Date.now(), d.id).run();
@@ -263,6 +348,25 @@ try {
   ok((await call(`/api/gsync/sources/${sourceId}/resume`, { method: "POST", body: "{}" })).status === 200, "resume");
   await syncUntilIdle();
   ok(await child(dest, "g.jpg"), "resumed sync copies the waiting file");
+
+  await countersMatch("after storage pause/resume");
+
+  // 5b. Daily write cap: work waits for tomorrow, the page says so, changes are still read
+  const spent = (await env.DB.prepare("SELECT writes FROM gsync_daily WHERE day = ?").bind(new Date().toISOString().slice(0, 10)).first<{ writes: number }>())!.writes;
+  ok(spent > 0, `today's estimated sync writes are tracked (${spent})`);
+  const cap = gs.SYNC_LIMITS.dailyWrites;
+  gs.SYNC_LIMITS.dailyWrites = spent;
+  put({ id: "h", name: "h.jpg", mimeType: "image/jpeg", parents: ["PHOTOS"], content: bytes("HHH") });
+  await measuredRun();
+  await measuredRun();
+  const limited = await call("/api/gsync");
+  ok(limited.body.dailyLimitReached && !(await child(dest, "h.jpg")), "daily write cap pauses copying and the page shows it");
+  ok(await env.DB.prepare("SELECT 1 FROM gsync_items WHERE google_id = 'h' AND state = 'pending'").first(), "…but the new file is already queued for tomorrow");
+  gs.SYNC_LIMITS.dailyWrites = cap;
+  await syncUntilIdle();
+  ok(await child(dest, "h.jpg"), "copying continues once there's allowance again");
+  ok(maxQueriesPerRun <= 50, `never more than 50 D1 queries per run (max ${maxQueriesPerRun})`);
+  ok(maxRowsPerRun < 1000, `D1 rows read per run stay small (max ${maxRowsPerRun})`);
 
   // 6. Disconnect → error; stop syncing keeps files
   const other = await call(`/api/gsync/sources/${sourceId}/pause`, { method: "POST", body: "{}" });
@@ -286,6 +390,7 @@ try {
   }
   await env.DB.batch([
     env.DB.prepare("DELETE FROM gsync_users WHERE user_id = ?").bind(owner.id),
+    env.DB.prepare("DELETE FROM gsync_daily"),
     env.DB.prepare("DELETE FROM notifications WHERE user_id = ? AND type = 'gsync_done'").bind(owner.id),
     env.DB.prepare("UPDATE users SET storage_quota = NULL WHERE id = ?").bind(owner.id),
     savedToken

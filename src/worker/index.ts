@@ -12,7 +12,7 @@ import invites from "./routes/invites";
 import notifications from "./routes/notifications";
 import google from "./routes/google";
 import gsync from "./routes/gsync";
-import { runSync } from "./lib/gsync";
+import { gsyncHousekeeping, runSync } from "./lib/gsync";
 
 const app = new Hono<AppEnv>();
 
@@ -91,5 +91,6 @@ async function housekeeping(env: Env) {
           WHERE rn > 500)`,
     ),
   ]);
+  await gsyncHousekeeping(env);
   console.log(`cleanup: purged ${old.length} trashed items, aborted ${stale.length} uploads`);
 }

@@ -8,7 +8,7 @@ import type { SyncSource } from "../lib/types";
 import { formatBytes, timeAgo } from "../lib/format";
 import { Button, IconButton, Modal, useToast } from "../ui/primitives";
 
-type SyncData = { connected: boolean; sources: SyncSource[] };
+type SyncData = { connected: boolean; dailyLimitReached: boolean; sources: SyncSource[] };
 
 const CONNECT_URL = `/api/auth/google?sync=1&return=${encodeURIComponent("/google-sync")}`;
 
@@ -66,6 +66,13 @@ export function GoogleSyncPage() {
             <Plus size={18} /> Add a folder
           </Button>
         </div>
+      )}
+
+      {data?.dailyLimitReached && data.sources.some((s) => s.filesPending || s.foldersPending) && (
+        <p className="mb-4 rounded-2xl bg-surface-2 px-4 py-3 text-sm text-fg-2">
+          Today's copying limit is reached, so big first copies pause until tomorrow (UTC) to keep the rest of Family Drive fast
+          and within its free limits. New changes are still checked.
+        </p>
       )}
 
       {data && data.sources.length > 0 && (

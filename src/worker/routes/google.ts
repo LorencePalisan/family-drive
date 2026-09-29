@@ -292,6 +292,7 @@ google.delete("/google", async (c) => {
   await c.env.DB.batch([
     c.env.DB.prepare("DELETE FROM google_tokens WHERE user_id = ?").bind(me),
     // Sync can't run without access; Resume after reconnecting picks up where it left off.
+    c.env.DB.prepare("UPDATE gsync_users SET access_token_enc = NULL, access_token_expires = 0 WHERE user_id = ?").bind(me),
     c.env.DB.prepare("UPDATE gsync_sources SET status = 'error', status_message = ? WHERE user_id = ? AND status <> 'paused'").bind(
       "Google Drive was disconnected. Reconnect, then press Resume.",
       me,

@@ -3,7 +3,7 @@ import type { AppEnv } from "../types";
 import { fail } from "../types";
 import { newId } from "../lib/crypto";
 import { driveAccessToken, hasScope, DRIVE_READONLY_SCOPE } from "../lib/google";
-import { Drive, ensureChangesToken, GoogleError, runSync, type GFile } from "../lib/gsync";
+import { dailyLimitReached, Drive, ensureChangesToken, GoogleError, runSync, type GFile } from "../lib/gsync";
 import { cleanName } from "./files";
 
 const FOLDER_MIME = "application/vnd.google-apps.folder";
@@ -14,7 +14,7 @@ const GOOGLE_ID = /^[\w-]+$/;
 async function driveFor(env: Env, userId: string) {
   const token = (await hasScope(env, userId, DRIVE_READONLY_SCOPE)) ? await driveAccessToken(env, userId) : null;
   if (!token) fail(409, "Connect Google Drive sync first");
-  return new Drive(token!, { fetches: 20, deadline: Date.now() + 25_000 });
+  return new Drive(token!, { fetches: 20, deadline: Date.now() + 25_000, writes: 0 });
 }
 
 async function ownSource(env: Env, id: string, userId: string) {
@@ -24,35 +24,23 @@ async function ownSource(env: Env, id: string, userId: string) {
 
 const gsync = new Hono<AppEnv>();
 
-/** Everything the sync page shows: whether read access is granted, and each synced folder with its progress. */
+/** Everything the sync page shows. Progress comes from counters on each source, so polling this is cheap. */
 gsync.get("/gsync", async (c) => {
   const me = c.get("user").id;
-  const [sources, counts] = await c.env.DB.batch([
-    c.env.DB.prepare(
-      `SELECT id, name, google_folder_id AS googleFolderId, dest_folder_id AS destFolderId, status, status_message AS statusMessage,
-              first_sync_done_at AS firstSyncDoneAt, last_synced_at AS lastSyncedAt, created_at AS createdAt
-         FROM gsync_sources WHERE user_id = ? ORDER BY created_at`,
-    ).bind(me),
-    c.env.DB.prepare(
-      "SELECT source_id, kind, state, COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes FROM gsync_items WHERE user_id = ? GROUP BY source_id, kind, state",
-    ).bind(me),
-  ]);
-  const rows = counts.results as { source_id: string; kind: string; state: string; n: number; bytes: number }[];
-  const progress = (id: string) => {
-    const files = rows.filter((r) => r.source_id === id && r.kind === "file");
-    const sum = (state: string, key: "n" | "bytes" = "n") => files.filter((r) => r.state === state).reduce((a, r) => a + r[key], 0);
-    return {
-      filesDone: sum("done"),
-      filesPending: sum("pending"),
-      filesSkipped: sum("skipped"),
-      filesFailed: sum("error"),
-      bytesDone: sum("done", "bytes"),
-      foldersPending: rows.filter((r) => r.source_id === id && r.kind === "folder" && r.state === "pending").reduce((a, r) => a + r.n, 0),
-    };
-  };
+  const { results } = await c.env.DB.prepare(
+    `SELECT s.id, s.name, s.google_folder_id AS googleFolderId, s.dest_folder_id AS destFolderId, s.status, s.status_message AS statusMessage,
+            s.first_sync_done_at AS firstSyncDoneAt, u.changes_checked_at AS lastSyncedAt, s.created_at AS createdAt,
+            s.n_done AS filesDone, s.n_pending AS filesPending, s.n_skipped AS filesSkipped, s.n_error AS filesFailed,
+            s.bytes_done AS bytesDone, s.folders_pending AS foldersPending
+       FROM gsync_sources s LEFT JOIN gsync_users u ON u.user_id = s.user_id
+      WHERE s.user_id = ? ORDER BY s.created_at`,
+  )
+    .bind(me)
+    .all();
   return c.json({
     connected: await hasScope(c.env, me, DRIVE_READONLY_SCOPE),
-    sources: (sources.results as { id: string }[]).map((s) => ({ ...s, ...progress(s.id) })),
+    dailyLimitReached: await dailyLimitReached(c.env),
+    sources: results,
   });
 });
 
@@ -101,7 +89,7 @@ gsync.post("/gsync/sources", async (c) => {
       "INSERT INTO files (id, owner_id, parent_id, name, is_folder, size, created_at, updated_at, updated_by) VALUES (?, ?, NULL, ?, 1, 0, ?, ?, ?)",
     ).bind(destId, me, cleanName(`Google Drive · ${folder!.name}`), now, now, me),
     c.env.DB.prepare(
-      "INSERT INTO gsync_sources (id, user_id, google_folder_id, name, dest_folder_id, status, created_at) VALUES (?, ?, ?, ?, ?, 'active', ?)",
+      "INSERT INTO gsync_sources (id, user_id, google_folder_id, name, dest_folder_id, status, folders_pending, created_at) VALUES (?, ?, ?, ?, ?, 'active', 1, ?)",
     ).bind(id, me, folder!.id, folder!.name, destId, now),
     c.env.DB.prepare(
       `INSERT INTO gsync_items (user_id, google_id, source_id, kind, name, google_parent_id, file_id, state, updated_at)
@@ -125,10 +113,18 @@ gsync.post("/gsync/sources/:id/resume", async (c) => {
   const id = c.req.param("id");
   await ownSource(c.env, id, me);
   if (!(await hasScope(c.env, me, DRIVE_READONLY_SCOPE))) fail(409, "Connect Google Drive sync first");
-  await c.env.DB.batch([
-    c.env.DB.prepare("UPDATE gsync_sources SET status = 'active', status_message = NULL WHERE id = ?").bind(id),
-    c.env.DB.prepare("UPDATE gsync_items SET state = 'pending', attempts = 0, retry_at = 0, error = NULL WHERE source_id = ? AND state = 'error'").bind(id),
-  ]);
+  const { results: retried } = await c.env.DB.prepare(
+    "UPDATE gsync_items SET state = 'pending', attempts = 0, retry_at = 0, error = NULL WHERE source_id = ? AND state = 'error' RETURNING kind",
+  )
+    .bind(id)
+    .all<{ kind: string }>();
+  const files = retried.filter((r) => r.kind === "file").length;
+  await c.env.DB.prepare(
+    `UPDATE gsync_sources SET status = 'active', status_message = NULL,
+            n_error = n_error - ?2, n_pending = n_pending + ?3, folders_pending = folders_pending + ?4 WHERE id = ?1`,
+  )
+    .bind(id, retried.length, files, retried.length - files)
+    .run();
   c.executionCtx.waitUntil(runSync(c.env, { userId: me, force: true }));
   return c.json({ ok: true });
 });

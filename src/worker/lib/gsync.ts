@@ -6,23 +6,40 @@
  * the Drive Changes API tells us about new, edited and renamed files. Deletions in Google are ignored on purpose,
  * and anything removed in Family Drive is never re-added.
  *
- * Work runs in small batches (cron every minute, plus right after someone adds a folder or presses "Sync now")
- * because Workers Free allows only ~50 outgoing requests and ~50 D1 queries per invocation.
- * Anything unfinished, including a large file's multipart upload, simply continues on the next run.
+ * Built to stay inside Cloudflare's free limits:
+ * - Work runs in small batches (cron every minute, plus right after adding a folder or "Sync now"): Workers Free allows
+ *   ~50 outgoing requests and ~50 D1 queries per invocation. Unfinished work (even a large file's upload) continues next run.
+ * - Idle minutes cost two indexed lookups; people with nothing to do are skipped before any token refresh or write.
+ * - Every query is an index seek (never a scan of all items), and progress comes from counters on gsync_sources.
+ * - Estimated D1 writes per day are capped (SYNC_LIMITS.dailyWrites) so a big first copy can't use up the
+ *   whole app's daily write allowance (100k rows/day on the free plan); it just continues the next day.
  */
-import { newId } from "./crypto";
+import { decrypt, encrypt, newId } from "./crypto";
 import { driveAccessToken, hasScope, DRIVE_READONLY_SCOPE } from "./google";
 import { fileKey, thumbKey } from "./storage";
 import { notify } from "./notify";
 import { cleanName, quotaFor } from "../routes/files";
 
-/** Per-run limits sized for Workers Free. On Workers Paid these can be raised a lot (1000 requests/queries per run). */
-export const SYNC_LIMITS = { fetches: 40, files: 5, folders: 3, changesEveryMs: 4 * 60_000, partSize: 100 * 1024 * 1024 };
+/** Limits sized for the free plans. On Workers Paid + D1 paid these can be raised a lot (1000 requests/queries per run). */
+export const SYNC_LIMITS = {
+  fetches: 40, // Google requests per run (Workers Free: 50 subrequests per invocation)
+  files: 3, // files per run: ~9 D1 queries each (Workers Free: 50 D1 queries per invocation)
+  folders: 3, // folder listings per run (a run does folders or files, not both)
+  listPageSize: 500, // Google items per listing page (keeps each run's CPU time small)
+  changesEveryMs: 5 * 60_000,
+  partSize: 100 * 1024 * 1024,
+  dailyWrites: 50_000, // estimated D1 rows written per UTC day by sync (half of the free plan's 100k)
+};
+// Estimated D1 rows written, measured against D1's rows_written and rounded up so the daily cap errs on the safe side.
+const WRITES_PER_FILE = 18; // files + indexes + search index + version + usage + item + counters
+const WRITES_PER_ITEM = 3; // a discovered item: row + indexes
+const WRITES_PER_RUN = 4; // lease, token cache, changes cursor, daily tally
 
 const API = "https://www.googleapis.com/drive/v3";
 const FOLDER_MIME = "application/vnd.google-apps.folder";
 const MAX_ATTEMPTS = 5;
 const LEASE_MS = 10 * 60_000;
+const TOKEN_TTL_MS = 50 * 60_000; // Google access tokens last an hour
 const ITEM_FIELDS = "id,name,mimeType,parents,trashed,md5Checksum,modifiedTime,size,appProperties";
 
 export const MSG = {
@@ -83,9 +100,10 @@ type ItemRow = {
   mpu_offset: number;
 };
 
-// ---- Google API with a per-run request budget ---------------------------------------------------
+// ---- Google API with a per-run budget -----------------------------------------------------------
 
-export type Budget = { fetches: number; deadline: number };
+/** fetches/deadline: this run. writes: estimated D1 rows sync may still write today. */
+export type Budget = { fetches: number; deadline: number; writes: number };
 export class OutOfBudget extends Error {}
 export class GoogleError extends Error {
   constructor(
@@ -151,21 +169,70 @@ function classify(f: GFile): { kind: "folder" | "file"; state: "pending" | "skip
   return { kind: "file", state: "pending", error: null };
 }
 
-/** Track new Google items (one statement for the whole list, via json_each). Items already tracked are left alone. */
+// Progress counters on gsync_sources, adjusted in the same batch as each item's state change.
+type Counts = Partial<Record<"n_pending" | "n_done" | "n_skipped" | "n_error" | "bytes_done" | "folders_pending", number>>;
+
+function bump(env: Env, sourceId: string, d: Counts) {
+  const cols = Object.entries(d).filter(([, v]) => v);
+  if (!cols.length) return null;
+  return env.DB.prepare(`UPDATE gsync_sources SET ${cols.map(([k], i) => `${k} = ${k} + ?${i + 2}`).join(", ")} WHERE id = ?1`).bind(
+    sourceId,
+    ...cols.map(([, v]) => v),
+  );
+}
+
+/** Counter change for an item leaving "pending" for another state. */
+function leavePending(item: Pick<ItemRow, "kind">, to: "done" | "skipped" | "error", bytes = 0): Counts {
+  const from: Counts = item.kind === "folder" ? { folders_pending: -1 } : { n_pending: -1 };
+  if (to === "error") return { ...from, n_error: 1 };
+  if (item.kind === "folder") return from;
+  return to === "done" ? { ...from, n_done: 1, bytes_done: bytes } : { ...from, n_skipped: 1 };
+}
+
+const itemUpdate = (env: Env, item: Pick<ItemRow, "user_id" | "google_id">, fields: Record<string, unknown>) => {
+  const cols = Object.keys(fields);
+  return env.DB.prepare(
+    `UPDATE gsync_items SET ${cols.map((k, i) => `${k} = ?${i + 3}`).join(", ")}, updated_at = ?${cols.length + 3} WHERE user_id = ?1 AND google_id = ?2`,
+  ).bind(item.user_id, item.google_id, ...Object.values(fields), Date.now());
+};
+
+/** Update an item and its source's counters together. */
+async function transition(env: Env, item: ItemRow, fields: Record<string, unknown>, counts: Counts = {}) {
+  const b = bump(env, item.source_id, counts);
+  await env.DB.batch(b ? [itemUpdate(env, item, fields), b] : [itemUpdate(env, item, fields)]);
+}
+
+const skip = (env: Env, item: ItemRow, reason: string) =>
+  transition(env, item, { state: "skipped", error: reason, page_token: null }, leavePending(item, "skipped"));
+
+/** A failed item is retried with backoff (2, 4, 8, 16 min) and then marked as an error the person can see and retry. */
+async function failItem(env: Env, item: ItemRow, err: unknown) {
+  const attempts = item.attempts + 1;
+  const message = (err instanceof Error ? err.message : String(err)).slice(0, 300);
+  console.warn("gsync item failed", item.google_id, message);
+  if (attempts >= MAX_ATTEMPTS) await transition(env, item, { state: "error", error: message, attempts }, leavePending(item, "error"));
+  else await transition(env, item, { error: message, attempts, retry_at: Date.now() + 2 ** attempts * 60_000 });
+}
+
+/** Track new Google items with one statement (json_each), then count what was actually added. Known items are left alone. */
 export async function insertItems(env: Env, userId: string, sourceId: string, files: GFile[], parentId?: string) {
   if (!files.length) return;
   const rows = files.map((f) => {
     const c = classify(f);
     return { id: f.id, name: f.name, kind: c.kind, parent: parentId ?? f.parents?.[0] ?? null, size: Number(f.size ?? 0), state: c.state, error: c.error };
   });
-  await env.DB.prepare(
+  const { results } = await env.DB.prepare(
     `INSERT OR IGNORE INTO gsync_items (user_id, google_id, source_id, kind, name, google_parent_id, size, state, error, updated_at)
      SELECT ?1, json_extract(value, '$.id'), ?2, json_extract(value, '$.kind'), json_extract(value, '$.name'), json_extract(value, '$.parent'),
             json_extract(value, '$.size'), json_extract(value, '$.state'), json_extract(value, '$.error'), ?3
-       FROM json_each(?4)`,
+       FROM json_each(?4)
+     RETURNING kind, state`,
   )
     .bind(userId, sourceId, Date.now(), JSON.stringify(rows))
-    .run();
+    .all<{ kind: string; state: string }>();
+  const n = (kind: string, state: string) => results.filter((r) => r.kind === kind && r.state === state).length;
+  const b = bump(env, sourceId, { folders_pending: n("folder", "pending"), n_pending: n("file", "pending"), n_skipped: n("file", "skipped") });
+  if (b) await b.run();
 }
 
 async function aliveFolder(env: Env, fileId: string | null) {
@@ -180,40 +247,50 @@ async function hasRoom(env: Env, userId: string, bytes: number) {
   return !!row && row.storage_used + bytes <= quotaFor(env, row.storage_quota);
 }
 
-const setItem = (env: Env, item: Pick<ItemRow, "user_id" | "google_id">, fields: Record<string, unknown>) => {
-  const cols = Object.keys(fields);
-  return env.DB.prepare(`UPDATE gsync_items SET ${cols.map((k, i) => `${k} = ?${i + 3}`).join(", ")}, updated_at = ?${cols.length + 3} WHERE user_id = ?1 AND google_id = ?2`)
-    .bind(item.user_id, item.google_id, ...Object.values(fields), Date.now())
-    .run();
-};
-
-const skip = (env: Env, item: ItemRow, reason: string) => setItem(env, item, { state: "skipped", error: reason, page_token: null });
-
-/** A failed item is retried with backoff (2, 4, 8, 16 min) and then marked as an error the person can see and retry. */
-async function failItem(env: Env, item: ItemRow, err: unknown) {
-  const attempts = item.attempts + 1;
-  const message = (err instanceof Error ? err.message : String(err)).slice(0, 300);
-  console.warn("gsync item failed", item.google_id, message);
-  await setItem(env, item, attempts >= MAX_ATTEMPTS ? { state: "error", error: message, attempts } : { error: message, attempts, retry_at: Date.now() + 2 ** attempts * 60_000 });
-}
+const utcDay = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 
 // ---- Run ----------------------------------------------------------------------------------------
 
 /** Process sync work for everyone with an active source (or just one person), within one invocation's limits. */
 export async function runSync(env: Env, opts: { userId?: string; force?: boolean; ms?: number } = {}) {
-  const budget: Budget = { fetches: SYNC_LIMITS.fetches, deadline: Date.now() + (opts.ms ?? 25_000) };
+  const now = Date.now();
+  const day = utcDay(now);
+  const used = (await env.DB.prepare("SELECT writes FROM gsync_daily WHERE day = ?").bind(day).first<{ writes: number }>())?.writes ?? 0;
+  const budget: Budget = { fetches: SYNC_LIMITS.fetches, deadline: now + (opts.ms ?? 25_000), writes: SYNC_LIMITS.dailyWrites - used };
+  const startWrites = budget.writes;
+
+  // Who has something to do? Index seeks only, so an idle minute costs almost nothing.
   const { results } = await env.DB.prepare(
-    `SELECT DISTINCT user_id FROM gsync_sources WHERE status = 'active'${opts.userId ? " AND user_id = ?" : ""}`,
+    `SELECT s.user_id, COALESCE(MAX(u.changes_checked_at), 0) AS checked,
+            MAX(EXISTS (SELECT 1 FROM gsync_items i WHERE i.source_id = s.id AND i.state = 'pending' AND i.kind = 'folder' AND i.retry_at <= ?1)
+             OR EXISTS (SELECT 1 FROM gsync_items i WHERE i.source_id = s.id AND i.state = 'pending' AND i.kind = 'file' AND i.retry_at <= ?1)) AS work
+       FROM gsync_sources s LEFT JOIN gsync_users u ON u.user_id = s.user_id
+      WHERE s.status = 'active'${opts.userId ? " AND s.user_id = ?2" : ""}
+      GROUP BY s.user_id`,
   )
-    .bind(...(opts.userId ? [opts.userId] : []))
-    .all<{ user_id: string }>();
-  // Shuffle so one person's big first sync can't starve everyone else's.
-  const users = results.map((r) => r.user_id).sort(() => Math.random() - 0.5);
-  for (const userId of users) {
-    if (budget.fetches < 3 || Date.now() > budget.deadline) break;
-    await runUser(env, userId, budget, !!opts.force);
+    .bind(now, ...(opts.userId ? [opts.userId] : []))
+    .all<{ user_id: string; checked: number; work: number }>();
+  const due = results
+    .filter((r) => opts.force || (r.work && budget.writes > 0) || now - r.checked > SYNC_LIMITS.changesEveryMs)
+    // Shuffle so one person's big first sync can't starve everyone else's.
+    .sort(() => Math.random() - 0.5);
+
+  try {
+    for (const r of due) {
+      if (budget.fetches < 3 || Date.now() > budget.deadline) break;
+      await runUser(env, r.user_id, budget, !!opts.force);
+    }
+  } finally {
+    const spent = startWrites - budget.writes;
+    if (spent > 0) {
+      await env.DB.prepare("INSERT INTO gsync_daily (day, writes) VALUES (?1, ?2) ON CONFLICT (day) DO UPDATE SET writes = writes + ?2")
+        .bind(day, spent)
+        .run();
+    }
   }
 }
+
+type Lease = { changes_page_token: string | null; changes_checked_at: number; access_token_enc: string | null; access_token_expires: number };
 
 async function runUser(env: Env, userId: string, budget: Budget, force: boolean) {
   const now = Date.now();
@@ -221,15 +298,15 @@ async function runUser(env: Env, userId: string, budget: Budget, force: boolean)
   const lease = await env.DB.prepare(
     `INSERT INTO gsync_users (user_id, locked_until) VALUES (?1, ?2)
      ON CONFLICT (user_id) DO UPDATE SET locked_until = ?2 WHERE gsync_users.locked_until < ?3
-     RETURNING changes_page_token, changes_checked_at`,
+     RETURNING changes_page_token, changes_checked_at, access_token_enc, access_token_expires`,
   )
     .bind(userId, now + LEASE_MS, now)
-    .first<{ changes_page_token: string | null; changes_checked_at: number }>();
+    .first<Lease>();
   if (!lease) return;
+  budget.writes -= WRITES_PER_RUN;
 
   try {
-    const token = (await hasScope(env, userId, DRIVE_READONLY_SCOPE)) ? await driveAccessToken(env, userId) : null;
-    budget.fetches--;
+    const token = await accessToken(env, userId, lease, budget);
     if (!token) {
       await env.DB.prepare("UPDATE gsync_sources SET status = 'error', status_message = ? WHERE user_id = ? AND status = 'active'")
         .bind(MSG.reconnect, userId)
@@ -238,14 +315,31 @@ async function runUser(env: Env, userId: string, budget: Budget, force: boolean)
     }
     const g = new Drive(token, budget);
     if (force || now - lease.changes_checked_at > SYNC_LIMITS.changesEveryMs) await pullChanges(env, g, userId, lease.changes_page_token);
-    await processFolders(env, g, userId);
-    await processFiles(env, g, userId);
+    // Folders first (to discover the tree), files once there are none left. Never both, to stay under the per-run query limit.
+    if (budget.writes > 0 && !(await processFolders(env, g, userId, budget))) await processFiles(env, g, userId, budget);
     await finishSources(env, userId);
   } catch (err) {
-    if (!(err instanceof OutOfBudget)) console.error("gsync run failed", userId, err);
+    if (err instanceof GoogleError && err.status === 401) {
+      // The cached token stopped working (e.g. access was revoked): refresh it next run.
+      await env.DB.prepare("UPDATE gsync_users SET access_token_enc = NULL, access_token_expires = 0 WHERE user_id = ?").bind(userId).run();
+    } else if (!(err instanceof OutOfBudget)) console.error("gsync run failed", userId, err);
   } finally {
     await env.DB.prepare("UPDATE gsync_users SET locked_until = 0 WHERE user_id = ?").bind(userId).run();
   }
+}
+
+/** Reuse the access token for its hour instead of refreshing it every run. */
+async function accessToken(env: Env, userId: string, lease: Lease, budget: Budget) {
+  if (lease.access_token_enc && lease.access_token_expires > Date.now()) return decrypt(lease.access_token_enc, env.TOKEN_ENC_KEY);
+  if (!(await hasScope(env, userId, DRIVE_READONLY_SCOPE))) return null;
+  budget.fetches--;
+  const token = await driveAccessToken(env, userId);
+  if (token) {
+    await env.DB.prepare("UPDATE gsync_users SET access_token_enc = ?, access_token_expires = ? WHERE user_id = ?")
+      .bind(await encrypt(token, env.TOKEN_ENC_KEY), Date.now() + TOKEN_TTL_MS, userId)
+      .run();
+  }
+  return token;
 }
 
 /** Start watching for changes from now on (called before a source's first walk, so nothing is missed in between). */
@@ -271,7 +365,7 @@ async function pullChanges(env: Env, g: Drive, userId: string, pageToken: string
       newStartPageToken?: string;
       changes: { fileId: string; removed?: boolean; file?: GFile }[];
     }>(
-      `${API}/changes?pageToken=${encodeURIComponent(token)}&pageSize=1000&spaces=drive` +
+      `${API}/changes?pageToken=${encodeURIComponent(token)}&pageSize=${SYNC_LIMITS.listPageSize}&spaces=drive` +
         `&fields=${encodeURIComponent(`nextPageToken,newStartPageToken,changes(fileId,removed,file(${ITEM_FIELDS}))`)}`,
     );
     // Deletions and trashing in Google are deliberately ignored: this is a backup, not a mirror.
@@ -287,24 +381,38 @@ export async function applyChanges(env: Env, userId: string, files: GFile[]) {
   if (!files.length) return;
   const ids = [...new Set(files.flatMap((f) => [f.id, ...(f.parents ?? [])]))];
   const { results } = await env.DB.prepare(
-    `SELECT google_id, source_id, kind, name, google_parent_id, file_id, google_version, state, error
+    `SELECT google_id, source_id, kind, name, google_parent_id, file_id, google_version, size, state, error
        FROM gsync_items WHERE user_id = ? AND google_id IN (SELECT value FROM json_each(?))`,
   )
     .bind(userId, JSON.stringify(ids))
-    .all<Pick<ItemRow, "google_id" | "source_id" | "kind" | "name" | "google_parent_id" | "file_id" | "google_version" | "state" | "error">>();
+    .all<Pick<ItemRow, "google_id" | "source_id" | "kind" | "name" | "google_parent_id" | "file_id" | "google_version" | "size" | "state" | "error">>();
   const known = new Map(results.map((r) => [r.google_id, r]));
 
   const requeue: string[] = [];
-  const renames: { id: string; name: string; fileId: string | null }[] = [];
+  const counts = new Map<string, Required<Pick<Counts, "n_pending" | "n_done" | "n_skipped" | "n_error" | "bytes_done">>>();
+  const count = (sourceId: string) => {
+    if (!counts.has(sourceId)) counts.set(sourceId, { n_pending: 0, n_done: 0, n_skipped: 0, n_error: 0, bytes_done: 0 });
+    return counts.get(sourceId)!;
+  };
+  const renames: { id: string; name: string; fileId: string | null; familyName: string }[] = [];
   const added = new Map<string, GFile[]>(); // by source
   for (const f of files) {
     const item = known.get(f.id);
     if (item) {
       const edited = item.kind === "file" && (item.state === "done" || item.state === "error") && item.google_version !== versionOf(f);
       const restored = item.state === "skipped" && (item.error === MSG.trashedInGoogle || item.error === MSG.deletedInGoogle);
-      if (edited || restored) requeue.push(f.id);
+      if (edited || restored) {
+        requeue.push(f.id);
+        const c = count(item.source_id);
+        c.n_pending++;
+        if (item.state === "done") (c.n_done--, (c.bytes_done -= item.size));
+        else if (item.state === "error") c.n_error--;
+        else c.n_skipped--;
+      }
       // A synced folder's own name stays "Google Drive · <name>" (it has no parent item).
-      if (item.name !== f.name && item.google_parent_id) renames.push({ id: f.id, name: f.name, fileId: item.file_id });
+      if (item.name !== f.name && item.google_parent_id) {
+        renames.push({ id: f.id, name: f.name, fileId: item.file_id, familyName: f.mimeType === FOLDER_MIME ? cleanName(f.name) : familyName(f) });
+      }
       continue;
     }
     const parent = f.parents?.map((p) => known.get(p)).find((p) => p?.kind === "folder" && p.state !== "skipped");
@@ -321,14 +429,13 @@ export async function applyChanges(env: Env, userId: string, files: GFile[]) {
           WHERE user_id = ?2 AND google_id IN (SELECT value FROM json_each(?3))`,
       ).bind(now, userId, JSON.stringify(requeue)),
     );
+    for (const [sourceId, c] of counts) {
+      const b = bump(env, sourceId, c);
+      if (b) stmts.push(b);
+    }
   }
   if (renames.length) {
-    const json = JSON.stringify(
-      renames.map((r) => {
-        const f = files.find((x) => x.id === r.id)!;
-        return { id: r.id, name: r.name, fileId: r.fileId, familyName: f.mimeType === FOLDER_MIME ? cleanName(f.name) : familyName(f) };
-      }),
-    );
+    const json = JSON.stringify(renames);
     stmts.push(
       env.DB.prepare(
         `UPDATE gsync_items SET name = (SELECT json_extract(value, '$.name') FROM json_each(?3) WHERE json_extract(value, '$.id') = google_id), updated_at = ?1
@@ -345,26 +452,46 @@ export async function applyChanges(env: Env, userId: string, files: GFile[]) {
 
 // ---- Folders (discover what's inside) -----------------------------------------------------------
 
-async function processFolders(env: Env, g: Drive, userId: string) {
-  const { results } = await env.DB.prepare(
-    `SELECT i.* FROM gsync_items i JOIN gsync_sources s ON s.id = i.source_id
-      WHERE i.user_id = ? AND i.state = 'pending' AND i.kind = 'folder' AND i.retry_at <= ? AND s.status = 'active'
-      LIMIT ?`,
-  )
-    .bind(userId, Date.now(), SYNC_LIMITS.folders)
-    .all<ItemRow>();
-  for (const item of results) {
-    if (!g.canFetch) return;
+/** The next pending items of each active source, by index (never a scan of everything pending). */
+async function nextItems(env: Env, userId: string, kind: "folder" | "file", limit: number) {
+  const { results: sources } = await env.DB.prepare("SELECT id FROM gsync_sources WHERE user_id = ? AND status = 'active'")
+    .bind(userId)
+    .all<{ id: string }>();
+  const items: ItemRow[] = [];
+  for (const s of sources) {
+    if (items.length >= limit) break;
+    // An unfinished large-file upload goes first so it isn't left half-done.
+    const partial =
+      kind === "file"
+        ? await env.DB.prepare("SELECT * FROM gsync_items WHERE source_id = ? AND mpu_id IS NOT NULL AND state = 'pending' LIMIT 1").bind(s.id).first<ItemRow>()
+        : null;
+    const { results } = await env.DB.prepare(
+      "SELECT * FROM gsync_items WHERE source_id = ? AND state = 'pending' AND kind = ? AND retry_at <= ? LIMIT ?",
+    )
+      .bind(s.id, kind, Date.now(), limit - items.length)
+      .all<ItemRow>();
+    if (partial) items.push(partial);
+    items.push(...results.filter((r) => r.google_id !== partial?.google_id));
+  }
+  return items.slice(0, limit);
+}
+
+/** Returns how many folders were worked on (0 = none pending, so files can go next). */
+async function processFolders(env: Env, g: Drive, userId: string, budget: Budget) {
+  const items = await nextItems(env, userId, "folder", SYNC_LIMITS.folders);
+  for (const item of items) {
+    if (!g.canFetch || budget.writes <= 0) break;
     try {
-      await processFolder(env, g, item);
+      await processFolder(env, g, item, budget);
     } catch (err) {
-      if (err instanceof OutOfBudget) throw err;
+      if (err instanceof OutOfBudget || (err instanceof GoogleError && err.status === 401)) throw err;
       await failItem(env, item, err);
     }
   }
+  return items.length;
 }
 
-async function processFolder(env: Env, g: Drive, item: ItemRow) {
+async function processFolder(env: Env, g: Drive, item: ItemRow, budget: Budget) {
   let folderId = item.file_id;
   if (!folderId) {
     const parent = await env.DB.prepare("SELECT file_id FROM gsync_items WHERE user_id = ? AND google_id = ?")
@@ -377,43 +504,38 @@ async function processFolder(env: Env, g: Drive, item: ItemRow) {
       env.DB.prepare(
         "INSERT INTO files (id, owner_id, parent_id, name, is_folder, size, created_at, updated_at, updated_by) VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?)",
       ).bind(folderId, item.user_id, parent!.file_id, cleanName(item.name), now, now, item.user_id),
-      env.DB.prepare("UPDATE gsync_items SET file_id = ?, updated_at = ? WHERE user_id = ? AND google_id = ?").bind(folderId, now, item.user_id, item.google_id),
+      itemUpdate(env, item, { file_id: folderId }),
     ]);
+    budget.writes -= WRITES_PER_FILE;
   } else if (!(await aliveFolder(env, folderId))) {
     return skip(env, item, MSG.removedHere);
   }
 
   const page = await g.json<{ nextPageToken?: string; files: GFile[] }>(
-    `${API}/files?q=${encodeURIComponent(`'${item.google_id}' in parents and trashed = false`)}&pageSize=1000` +
+    `${API}/files?q=${encodeURIComponent(`'${item.google_id}' in parents and trashed = false`)}&pageSize=${SYNC_LIMITS.listPageSize}` +
       `&fields=${encodeURIComponent(`nextPageToken,files(${ITEM_FIELDS})`)}${item.page_token ? `&pageToken=${encodeURIComponent(item.page_token)}` : ""}`,
   );
   await insertItems(env, item.user_id, item.source_id, page.files, item.google_id);
-  await setItem(env, item, page.nextPageToken ? { page_token: page.nextPageToken } : { state: "done", page_token: null, error: null, attempts: 0 });
+  budget.writes -= WRITES_PER_ITEM * page.files.length;
+  if (page.nextPageToken) await transition(env, item, { page_token: page.nextPageToken });
+  else await transition(env, item, { state: "done", page_token: null, error: null, attempts: 0 }, leavePending(item, "done"));
 }
 
 // ---- Files (copy content) -----------------------------------------------------------------------
 
-async function processFiles(env: Env, g: Drive, userId: string) {
-  const { results } = await env.DB.prepare(
-    `SELECT i.* FROM gsync_items i JOIN gsync_sources s ON s.id = i.source_id
-      WHERE i.user_id = ? AND i.state = 'pending' AND i.kind = 'file' AND i.retry_at <= ? AND s.status = 'active'
-      ORDER BY i.mpu_id IS NULL, i.updated_at
-      LIMIT ?`,
-  )
-    .bind(userId, Date.now(), SYNC_LIMITS.files)
-    .all<ItemRow>();
-  for (const item of results) {
-    if (!g.canFetch) return;
+async function processFiles(env: Env, g: Drive, userId: string, budget: Budget) {
+  for (const item of await nextItems(env, userId, "file", SYNC_LIMITS.files)) {
+    if (!g.canFetch || budget.writes <= 0) return;
     try {
-      await processFile(env, g, item);
+      await processFile(env, g, item, budget);
     } catch (err) {
-      if (err instanceof OutOfBudget) throw err;
+      if (err instanceof OutOfBudget || (err instanceof GoogleError && err.status === 401)) throw err;
       await failItem(env, item, err);
     }
   }
 }
 
-async function processFile(env: Env, g: Drive, item: ItemRow) {
+async function processFile(env: Env, g: Drive, item: ItemRow, budget: Budget) {
   let meta: GFileFull;
   try {
     meta = await g.json<GFileFull>(
@@ -428,22 +550,27 @@ async function processFile(env: Env, g: Drive, item: ItemRow) {
   if (meta.trashed) return skip(env, item, MSG.trashedInGoogle);
   const kind = classify(meta);
   if (kind.state === "skipped") return skip(env, item, kind.error!);
-  if (await env.DB.prepare("SELECT 1 FROM google_links WHERE google_file_id = ? LIMIT 1").bind(meta.id).first()) return skip(env, item, MSG.madeByUs);
+
+  // One query: is this our own "Open with Google" copy, and does its Family Drive file / parent folder still exist?
+  const ctx = (await env.DB.prepare(
+    `SELECT EXISTS (SELECT 1 FROM google_links WHERE google_file_id = ?1) AS ours,
+            (SELECT id FROM files WHERE id = ?2 AND trashed_at IS NULL) AS existing,
+            (SELECT f.id FROM gsync_items p JOIN files f ON f.id = p.file_id
+              WHERE p.user_id = ?3 AND p.google_id = ?4 AND f.is_folder = 1 AND f.trashed_at IS NULL) AS parent`,
+  )
+    .bind(meta.id, item.file_id, item.user_id, item.google_parent_id)
+    .first<{ ours: number; existing: string | null; parent: string | null }>())!;
+  if (ctx.ours) return skip(env, item, MSG.madeByUs);
 
   const version = versionOf(meta);
-  let existing: { id: string } | null = null;
+  const existing = ctx.existing;
   if (item.file_id) {
-    existing = await env.DB.prepare("SELECT id FROM files WHERE id = ? AND trashed_at IS NULL").bind(item.file_id).first<{ id: string }>();
     if (!existing) return skip(env, item, MSG.removedHere);
-    if (item.google_version === version && !item.mpu_id) return setItem(env, item, { state: "done", error: null, attempts: 0 });
-  }
-  let parentId: string | null = null;
-  if (!existing) {
-    const parent = await env.DB.prepare("SELECT file_id FROM gsync_items WHERE user_id = ? AND google_id = ?")
-      .bind(item.user_id, item.google_parent_id)
-      .first<{ file_id: string | null }>();
-    if (!(await aliveFolder(env, parent?.file_id ?? null))) return skip(env, item, MSG.parentRemoved);
-    parentId = parent!.file_id;
+    if (item.google_version === version && !item.mpu_id) {
+      return transition(env, item, { state: "done", error: null, attempts: 0 }, leavePending(item, "done", item.size));
+    }
+  } else if (!ctx.parent) {
+    return skip(env, item, MSG.parentRemoved);
   }
 
   const native = NATIVE[meta.mimeType];
@@ -455,10 +582,10 @@ async function processFile(env: Env, g: Drive, item: ItemRow) {
   const mpu = item.mpu_id ? (JSON.parse(item.mpu_parts ?? "{}") as { v?: string | null; parts?: R2UploadedPart[] }) : null;
   if (item.mpu_id && mpu?.v !== version) {
     await env.BUCKET.resumeMultipartUpload(item.mpu_key!, item.mpu_id).abort().catch(() => {});
-    await setItem(env, item, { mpu_id: null, mpu_key: null, mpu_version_id: null, mpu_parts: null, mpu_offset: 0 });
+    await itemUpdate(env, item, { mpu_id: null, mpu_key: null, mpu_version_id: null, mpu_parts: null, mpu_offset: 0 }).run();
     item = { ...item, mpu_id: null, mpu_key: null, mpu_version_id: null, mpu_parts: null, mpu_offset: 0 };
   }
-  const fileId = existing?.id ?? item.mpu_key?.split("/")[1] ?? newId();
+  const fileId = existing ?? item.mpu_key?.split("/")[1] ?? newId();
   const versionId = item.mpu_version_id ?? newId();
   const key = item.mpu_key ?? fileKey(fileId, versionId);
   const httpMetadata = { contentType: mime };
@@ -478,14 +605,16 @@ async function processFile(env: Env, g: Drive, item: ItemRow) {
     const upload = item.mpu_id ? env.BUCKET.resumeMultipartUpload(key, item.mpu_id) : await env.BUCKET.createMultipartUpload(key, { httpMetadata });
     const parts = mpu?.parts ?? [];
     let offset = item.mpu_offset;
-    if (!item.mpu_id) await setItem(env, item, { mpu_id: upload.uploadId, mpu_key: key, mpu_version_id: versionId, mpu_parts: JSON.stringify({ v: version, parts }), mpu_offset: 0 });
+    if (!item.mpu_id) {
+      await itemUpdate(env, item, { mpu_id: upload.uploadId, mpu_key: key, mpu_version_id: versionId, mpu_parts: JSON.stringify({ v: version, parts }), mpu_offset: 0 }).run();
+    }
     while (offset < size) {
       if (!g.canFetch) return; // continue next run
       const len = Math.min(SYNC_LIMITS.partSize, size - offset);
       const res = await g.fetch(`${API}/files/${meta.id}?alt=media`, { headers: { range: `bytes=${offset}-${offset + len - 1}` } });
       parts.push(await upload.uploadPart(parts.length + 1, res.body!.pipeThrough(new FixedLengthStream(len))));
       offset += len;
-      await setItem(env, item, { mpu_parts: JSON.stringify({ v: version, parts }), mpu_offset: offset });
+      await itemUpdate(env, item, { mpu_parts: JSON.stringify({ v: version, parts }), mpu_offset: offset }).run();
     }
     await upload.complete(parts);
   }
@@ -518,41 +647,69 @@ async function processFile(env: Env, g: Drive, item: ItemRow) {
       : env.DB.prepare(
           `INSERT INTO files (id, owner_id, parent_id, name, is_folder, mime, size, current_version_id, thumb_key, width, height, duration, created_at, updated_at, updated_by)
            VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).bind(fileId, item.user_id, parentId, name, mime, size, versionId, thumb, width, height, duration, now, now, item.user_id),
+        ).bind(fileId, item.user_id, ctx.parent, name, mime, size, versionId, thumb, width, height, duration, now, now, item.user_id),
     env.DB.prepare(
       "INSERT INTO file_versions (id, file_id, r2_key, size, mime, source, created_by, created_at) VALUES (?, ?, ?, ?, ?, 'google_sync', ?, ?)",
     ).bind(versionId, fileId, key, size, mime, item.user_id, now),
     env.DB.prepare("UPDATE users SET storage_used = storage_used + ? WHERE id = ?").bind(size, item.user_id),
-    env.DB.prepare(
-      `UPDATE gsync_items SET state = 'done', file_id = ?, google_version = ?, size = ?, name = ?, error = NULL, attempts = 0, retry_at = 0,
-              mpu_id = NULL, mpu_key = NULL, mpu_version_id = NULL, mpu_parts = NULL, mpu_offset = 0, updated_at = ?
-        WHERE user_id = ? AND google_id = ?`,
-    ).bind(fileId, version, size, meta.name, now, item.user_id, item.google_id),
+    itemUpdate(env, item, {
+      state: "done",
+      file_id: fileId,
+      google_version: version,
+      size,
+      name: meta.name,
+      error: null,
+      attempts: 0,
+      retry_at: 0,
+      mpu_id: null,
+      mpu_key: null,
+      mpu_version_id: null,
+      mpu_parts: null,
+      mpu_offset: 0,
+    }),
+    bump(env, item.source_id, leavePending(item, "done", size))!,
   ]);
+  budget.writes -= WRITES_PER_FILE;
 }
 
 async function pauseForStorage(env: Env, item: ItemRow) {
   await env.DB.prepare("UPDATE gsync_sources SET status = 'paused', status_message = ? WHERE id = ?").bind(MSG.storageFull, item.source_id).run();
 }
 
-/** Mark sources with nothing left to do as synced, and tell the person when a first copy finishes. */
+/** Tell the person when a folder's first copy finishes. Once that's happened this query matches nothing. */
 async function finishSources(env: Env, userId: string) {
   const { results } = await env.DB.prepare(
-    `SELECT s.id, s.name, s.dest_folder_id, s.first_sync_done_at,
-            (SELECT COUNT(*) FROM gsync_items i WHERE i.source_id = s.id AND i.state = 'pending') AS pending,
-            (SELECT COUNT(*) FROM gsync_items i WHERE i.source_id = s.id AND i.state = 'done' AND i.kind = 'file') AS done
-       FROM gsync_sources s WHERE s.user_id = ? AND s.status = 'active'`,
+    `SELECT id, dest_folder_id, n_done FROM gsync_sources s
+      WHERE user_id = ? AND status = 'active' AND first_sync_done_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM gsync_items i WHERE i.source_id = s.id AND i.state = 'pending')`,
   )
     .bind(userId)
-    .all<{ id: string; name: string; dest_folder_id: string; first_sync_done_at: number | null; pending: number; done: number }>();
-  const now = Date.now();
+    .all<{ id: string; dest_folder_id: string; n_done: number }>();
   for (const s of results) {
-    if (s.pending) continue;
-    await env.DB.prepare("UPDATE gsync_sources SET last_synced_at = ?, first_sync_done_at = COALESCE(first_sync_done_at, ?) WHERE id = ?")
-      .bind(now, now, s.id)
-      .run();
-    if (!s.first_sync_done_at) {
-      await notify(env, { userId, type: "gsync_done", fileId: s.dest_folder_id, payload: { folderName: s.name, count: s.done } });
-    }
+    await env.DB.prepare("UPDATE gsync_sources SET first_sync_done_at = ? WHERE id = ?").bind(Date.now(), s.id).run();
+    await notify(env, { userId, type: "gsync_done", fileId: s.dest_folder_id, payload: { count: s.n_done } });
   }
+}
+
+/** Daily: correct any drift in the progress counters, and forget old daily write tallies. */
+export async function gsyncHousekeeping(env: Env) {
+  const n = (where: string) => `(SELECT COUNT(*) FROM gsync_items i WHERE i.source_id = gsync_sources.id AND ${where})`;
+  await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE gsync_sources SET
+         n_pending = ${n("i.state = 'pending' AND i.kind = 'file'")},
+         n_done = ${n("i.state = 'done' AND i.kind = 'file'")},
+         n_skipped = ${n("i.state = 'skipped' AND i.kind = 'file'")},
+         n_error = ${n("i.state = 'error'")},
+         folders_pending = ${n("i.state = 'pending' AND i.kind = 'folder'")},
+         bytes_done = (SELECT COALESCE(SUM(size), 0) FROM gsync_items i WHERE i.source_id = gsync_sources.id AND i.state = 'done' AND i.kind = 'file')`,
+    ),
+    env.DB.prepare("DELETE FROM gsync_daily WHERE day < ?").bind(utcDay(Date.now() - 7 * 86_400_000)),
+  ]);
+}
+
+/** Whether sync has used up today's write allowance (shown on the sync page). */
+export async function dailyLimitReached(env: Env) {
+  const row = await env.DB.prepare("SELECT writes FROM gsync_daily WHERE day = ?").bind(utcDay(Date.now())).first<{ writes: number }>();
+  return (row?.writes ?? 0) >= SYNC_LIMITS.dailyWrites;
 }

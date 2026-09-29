@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import { sqliteTable, text, integer, primaryKey, index, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 // All timestamps are unix epoch milliseconds.
@@ -148,7 +149,7 @@ export const googleLinks = sqliteTable(
     sourceVersionId: text("source_version_id").notNull(),
     createdAt: integer("created_at").notNull(),
   },
-  (t) => [primaryKey({ columns: [t.fileId, t.userId] })],
+  (t) => [primaryKey({ columns: [t.fileId, t.userId] }), index("google_links_google_file_idx").on(t.googleFileId)],
 );
 
 export const notifications = sqliteTable(
@@ -198,7 +199,13 @@ export const gsyncSources = sqliteTable(
     status: text("status", { enum: ["active", "paused", "error"] }).notNull().default("active"),
     statusMessage: text("status_message"),
     firstSyncDoneAt: integer("first_sync_done_at"),
-    lastSyncedAt: integer("last_synced_at"),
+    // Progress counters, kept up to date as items change (recounted daily).
+    nPending: integer("n_pending").notNull().default(0),
+    nDone: integer("n_done").notNull().default(0),
+    nSkipped: integer("n_skipped").notNull().default(0),
+    nError: integer("n_error").notNull().default(0),
+    bytesDone: integer("bytes_done").notNull().default(0),
+    foldersPending: integer("folders_pending").notNull().default(0),
     createdAt: integer("created_at").notNull(),
   },
   (t) => [uniqueIndex("gsync_sources_user_folder_idx").on(t.userId, t.googleFolderId)],
@@ -208,6 +215,8 @@ export const gsyncUsers = sqliteTable("gsync_users", {
   userId: text("user_id").primaryKey().references(() => users.id, { onDelete: "cascade" }),
   changesPageToken: text("changes_page_token"),
   changesCheckedAt: integer("changes_checked_at").notNull().default(0),
+  accessTokenEnc: text("access_token_enc"),
+  accessTokenExpires: integer("access_token_expires").notNull().default(0),
   lockedUntil: integer("locked_until").notNull().default(0),
 });
 
@@ -237,10 +246,15 @@ export const gsyncItems = sqliteTable(
   },
   (t) => [
     primaryKey({ columns: [t.userId, t.googleId] }),
-    index("gsync_items_work_idx").on(t.userId, t.state, t.retryAt),
-    index("gsync_items_source_idx").on(t.sourceId, t.state),
+    index("gsync_items_work_idx").on(t.sourceId, t.state, t.kind, t.retryAt),
+    index("gsync_items_mpu_idx").on(t.sourceId).where(sql`mpu_id IS NOT NULL`),
   ],
 );
+
+export const gsyncDaily = sqliteTable("gsync_daily", {
+  day: text("day").primaryKey(), // UTC yyyy-mm-dd
+  writes: integer("writes").notNull().default(0), // estimated D1 rows written by sync
+});
 
 export type User = typeof users.$inferSelect;
 export type FileRow = typeof files.$inferSelect;
