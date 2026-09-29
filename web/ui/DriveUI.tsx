@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router";
 import { api, driveSource, downloadUrl } from "../lib/api";
 import type { ContentSource, DriveFile } from "../lib/types";
+import { fileKind } from "../lib/format";
 import { Button, Modal, inputClass, useToast } from "./primitives";
 import { ShareDialog } from "./ShareDialog";
 import { MoveDialog } from "./MoveDialog";
@@ -231,11 +232,15 @@ export function useFileActions() {
       },
       openInGoogle(file: DriveFile, app: "docs" | "sheets" | "slides") {
         window.open(`/api/files/${file.id}/open-in-google?app=${app}`, "_blank", "noopener");
+        // Opening a PDF also saves a .docx next to it; show it when the user comes back to this tab.
+        if (fileKind(file) === "pdf") window.addEventListener("focus", () => refresh(), { once: true });
       },
       saveFromGoogle: (file: DriveFile) =>
         guard(async () => {
-          await api(`/files/${file.id}/save-from-google`, { method: "POST" });
-          toast(`Saved the Google version of "${file.name}"`);
+          const saved = await api<DriveFile & { created?: boolean }>(`/files/${file.id}/save-from-google`, { method: "POST" });
+          if (saved.id === file.id) toast(`Saved the Google version of "${file.name}"`);
+          else toast(saved.created ? `Saved "${saved.name}" as a new file` : `Updated "${saved.name}"`);
+          refresh();
         }),
       copyLink: (file: DriveFile) =>
         guard(async () => {

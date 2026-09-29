@@ -34,7 +34,7 @@ export async function loadUser(c: Context<AppEnv>): Promise<User | null> {
   const token = getCookie(c, COOKIE);
   if (!token) return null;
   const row = await c.env.DB.prepare(
-    `SELECT u.id, u.email, u.name, u.avatar_url AS avatarUrl, u.role, u.storage_used AS storageUsed, u.theme, u.created_at AS createdAt
+    `SELECT u.id, u.email, u.name, u.avatar_url AS avatarUrl, u.role, u.storage_used AS storageUsed, u.storage_quota AS storageQuota, u.theme, u.created_at AS createdAt
        FROM sessions s JOIN users u ON u.id = s.user_id
       WHERE s.id = ? AND s.expires_at > ?`,
   )

@@ -23,7 +23,7 @@ import {
 } from "lucide-react";
 import type { ReactNode } from "react";
 import type { DriveFile } from "../lib/types";
-import { canPreview, googleApp } from "../lib/format";
+import { canPreview, fileKind, googleApp } from "../lib/format";
 import { useDriveUI, useFileActions } from "./DriveUI";
 import { useMe } from "./useMe";
 
@@ -106,6 +106,10 @@ function MenuItems({ kit: K, files, list, context }: { kit: Kit; files: DriveFil
   }
 
   const app = single && !single.isFolder ? googleApp(single.name) : null;
+  // A PDF opens as an editable Doc copy and is saved back as a separate .docx, so it never needs edit access.
+  const fromPdf = !!single && fileKind(single) === "pdf";
+  const canSaveBack = !!single && (fromPdf || single.role !== "viewer");
+  const saveLabel = fromPdf ? "Save changes to Word file (.docx)" : app ? `Save changes from ${GOOGLE_APPS[app].label}` : "";
   return (
     <>
       {single && !single.isFolder && context !== "preview" && (
@@ -119,9 +123,9 @@ function MenuItems({ kit: K, files, list, context }: { kit: Kit; files: DriveFil
               <MItem kit={K} icon={<GoogleIcon app={app} />} onSelect={() => act.openInGoogle(single, app)}>
                 {GOOGLE_APPS[app].label}
               </MItem>
-              {single.role !== "viewer" && (
+              {canSaveBack && (
                 <MItem kit={K} icon={<CloudDownload />} onSelect={() => act.saveFromGoogle(single)}>
-                  Save changes from {GOOGLE_APPS[app].label}
+                  {saveLabel}
                 </MItem>
               )}
             </>
@@ -133,9 +137,9 @@ function MenuItems({ kit: K, files, list, context }: { kit: Kit; files: DriveFil
           <MItem kit={K} icon={<GoogleIcon app={app} />} onSelect={() => act.openInGoogle(single, app)}>
             Open with {GOOGLE_APPS[app].label}
           </MItem>
-          {single.role !== "viewer" && (
+          {canSaveBack && (
             <MItem kit={K} icon={<CloudDownload />} onSelect={() => act.saveFromGoogle(single)}>
-              Save changes from {GOOGLE_APPS[app].label}
+              {saveLabel}
             </MItem>
           )}
         </>

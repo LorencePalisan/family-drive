@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { Link } from "react-router";
 import { ArrowLeft } from "lucide-react";
+import { Logo } from "../ui/primitives";
 
 const EFFECTIVE = "September 28, 2026";
 const CONTACT = "lorencepalisan@gmail.com";
@@ -10,7 +11,7 @@ function LegalLayout({ title, children }: { title: string; children: ReactNode }
     <div className="min-h-full bg-bg">
       <header className="flex h-16 items-center gap-3 px-4 sm:px-6">
         <Link to="/" className="flex items-center gap-2 rounded-full pr-3 hover:bg-hover">
-          <img src="/favicon.svg" alt="" className="size-9" />
+          <Logo className="size-9" />
           <span className="text-lg text-fg-2">Family Drive</span>
         </Link>
       </header>

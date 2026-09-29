@@ -5,6 +5,7 @@ import { newId, randomToken, sha256 } from "../lib/crypto";
 import { createSession, destroySession, loadUser, requireUser } from "../lib/session";
 import { exchangeCode, fetchProfile, googleAuthUrl, saveDriveToken, DRIVE_SCOPE } from "../lib/google";
 import { notify } from "../lib/notify";
+import { quotaFor } from "./files";
 
 type OAuthState = { state: string; returnTo: string; drive: boolean };
 
@@ -122,7 +123,7 @@ me.get("/", requireUser, async (c) => {
   const drive = await c.env.DB.prepare("SELECT 1 FROM google_tokens WHERE user_id = ?").bind(user.id).first();
   return c.json({
     ...user,
-    storageQuota: Number(c.env.STORAGE_QUOTA_BYTES),
+    storageQuota: quotaFor(c.env, user.storageQuota),
     googleDriveConnected: !!drive,
     appName: c.env.APP_NAME,
   });

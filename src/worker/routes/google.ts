@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import type { AppEnv } from "../types";
 import { fail } from "../types";
 import { newId } from "../lib/crypto";
-import { fileDTO, requireAccess, type FileRecord } from "../lib/access";
+import { atLeast, fileDTO, requireAccess, type FileRecord } from "../lib/access";
 import { driveAccessToken } from "../lib/google";
 import { fileKey } from "../lib/storage";
 import { notify } from "../lib/notify";
@@ -15,7 +15,8 @@ const APPS: Record<App, { googleMime: string; exportMime: string; ext: string; a
     googleMime: "application/vnd.google-apps.document",
     exportMime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ext: "docx",
-    accepts: /\.(docx?|odt|rtf|txt|html?)$/i,
+    // PDFs are converted (with OCR for scanned pages) into an editable Doc; the PDF itself is never overwritten.
+    accepts: /\.(docx?|odt|rtf|txt|html?|pdf)$/i,
   },
   sheets: {
     googleMime: "application/vnd.google-apps.spreadsheet",
@@ -38,6 +39,7 @@ export function googleAppFor(name: string): App | null {
 }
 
 const stripExt = (name: string) => name.replace(/\.[^.]+$/, "");
+const isPdf = (file: FileRecord) => file.mime === "application/pdf" || /\.pdf$/i.test(file.name);
 
 async function gfetch(token: string, url: string, init: RequestInit = {}) {
   const res = await fetch(url, { ...init, headers: { ...(init.headers as Record<string, string>), authorization: `Bearer ${token}` } });
@@ -97,7 +99,10 @@ google.get("/files/:id/open-in-google", async (c) => {
     const meta = await gfetch(token, `https://www.googleapis.com/drive/v3/files/${link.google_file_id}?fields=trashed`)
       .then((r) => r.json<{ trashed: boolean }>())
       .catch(() => null);
-    if (meta && !meta.trashed) return c.redirect(link.web_view_link);
+    if (meta && !meta.trashed) {
+      if (isPdf(file)) await ensurePdfDocx(c.env, token, file, me, link.google_file_id, link.web_view_link, null);
+      return c.redirect(link.web_view_link);
+    }
   }
 
   const created = await importToGoogle(c.env, token, file, app);
@@ -108,6 +113,7 @@ google.get("/files/:id/open-in-google", async (c) => {
   )
     .bind(file.id, me, created.id, APPS[app].googleMime, created.webViewLink, file.current_version_id, Date.now())
     .run();
+  if (isPdf(file)) await ensurePdfDocx(c.env, token, file, me, created.id, created.webViewLink, link?.google_file_id ?? null);
   await touchRecent(c.env, me, file.id, "opened");
   return c.redirect(created.webViewLink);
 });
@@ -124,7 +130,10 @@ google.get("/files/:id/google-link", async (c) => {
 /** Pull the edited Google copy back as a new version of our file (exported to docx/xlsx/pptx). */
 google.post("/files/:id/save-from-google", async (c) => {
   const me = c.get("user");
-  const { file } = await requireAccess(c.env, c.req.param("id"), me.id, "editor");
+  const { file } = await requireAccess(c.env, c.req.param("id"), me.id, "viewer");
+  const pdf = isPdf(file);
+  // A PDF is only read (its Doc is saved to a separate .docx), so viewers may do it; anything else is overwritten.
+  if (!pdf) await requireAccess(c.env, file.id, me.id, "editor");
   const link = await c.env.DB.prepare("SELECT google_file_id, google_mime FROM google_links WHERE file_id = ? AND user_id = ?")
     .bind(file.id, me.id)
     .first<{ google_file_id: string; google_mime: string }>();
@@ -133,44 +142,147 @@ google.post("/files/:id/save-from-google", async (c) => {
   const token = await driveAccessToken(c.env, me.id);
   if (!token) fail(401, "Reconnect Google Drive and try again");
 
-  // exportLinks avoids the 10 MB limit of files.export.
-  const meta = await (await gfetch(token!, `https://www.googleapis.com/drive/v3/files/${link!.google_file_id}?fields=exportLinks`)).json<{
+  const bytes = await exportFromGoogle(token!, link!.google_file_id, app);
+  await assertQuota(c.env, me.id, bytes.byteLength);
+  const name = `${stripExt(file.name)}.${APPS[app].ext}`;
+
+  if (pdf) {
+    // Update the .docx an earlier save made from this Doc, if it's still around and editable; otherwise make a new one.
+    const target = await pdfDocxFor(c.env, me.id, link!.google_file_id, file.id);
+    const savedId = target
+      ? await saveVersion(c.env, target.file, bytes, APPS[app].exportMime, target.file.name, me.id)
+      : await createFromGoogle(c.env, file, bytes, APPS[app].exportMime, name, me.id, link!);
+    return c.json({ ...(await fileDTO(c.env, savedId, me.id)), created: !target }, target ? 200 : 201);
+  }
+
+  await saveVersion(c.env, file, bytes, APPS[app].exportMime, name, me.id);
+  return c.json(await fileDTO(c.env, file.id, me.id));
+});
+
+/** Download a Google file as docx/xlsx/pptx. exportLinks avoids the 10 MB limit of files.export. */
+async function exportFromGoogle(token: string, googleFileId: string, app: App) {
+  const meta = await (await gfetch(token, `https://www.googleapis.com/drive/v3/files/${googleFileId}?fields=exportLinks`)).json<{
     exportLinks?: Record<string, string>;
   }>();
   const exportUrl = meta.exportLinks?.[APPS[app].exportMime];
   if (!exportUrl) fail(502, "Google can't export this file");
-  const bytes = await (await gfetch(token!, exportUrl!)).arrayBuffer();
-  await assertQuota(c.env, me.id, bytes.byteLength);
+  return (await gfetch(token, exportUrl!)).arrayBuffer();
+}
 
+/** The .docx saved from a PDF's Google Doc, if it still exists and the user can still update it. */
+async function pdfDocxFor(env: Env, userId: string, googleFileId: string, pdfId: string) {
+  const row = await env.DB.prepare(
+    `SELECT gl.file_id FROM google_links gl JOIN files f ON f.id = gl.file_id
+     WHERE gl.user_id = ? AND gl.google_file_id = ? AND gl.file_id != ? AND f.trashed_at IS NULL`,
+  )
+    .bind(userId, googleFileId, pdfId)
+    .first<{ file_id: string }>();
+  return row ? await requireAccess(env, row.file_id, userId, "editor").catch(() => null) : null;
+}
+
+/**
+ * Opening a PDF in Google Docs also saves the converted Doc to Family Drive as a .docx right away.
+ * If the PDF was converted before (an older Google Doc), that earlier .docx is updated and relinked instead of duplicated.
+ * Best effort: a failure here still lets the user into Google Docs, and "Save as Word document" can retry.
+ */
+async function ensurePdfDocx(
+  env: Env,
+  token: string,
+  pdf: FileRecord,
+  userId: string,
+  googleFileId: string,
+  webViewLink: string,
+  previousGoogleFileId: string | null,
+) {
+  try {
+    if (await pdfDocxFor(env, userId, googleFileId, pdf.id)) return;
+    const bytes = await exportFromGoogle(token, googleFileId, "docs");
+    await assertQuota(env, userId, bytes.byteLength);
+    const mime = APPS.docs.exportMime;
+    const earlier = previousGoogleFileId && previousGoogleFileId !== googleFileId ? await pdfDocxFor(env, userId, previousGoogleFileId, pdf.id) : null;
+    if (earlier) {
+      await env.DB.prepare("UPDATE google_links SET google_file_id = ?, web_view_link = ? WHERE file_id = ? AND user_id = ?")
+        .bind(googleFileId, webViewLink, earlier.file.id, userId)
+        .run();
+      await saveVersion(env, earlier.file, bytes, mime, earlier.file.name, userId);
+    } else {
+      await createFromGoogle(env, pdf, bytes, mime, `${stripExt(pdf.name)}.docx`, userId, { google_file_id: googleFileId, google_mime: APPS.docs.googleMime });
+    }
+  } catch (err) {
+    console.error("saving .docx from PDF failed", pdf.id, err);
+  }
+}
+
+/** Store exported bytes as the file's new current version. The Google copy then matches it, so reopening reuses it. */
+async function saveVersion(env: Env, file: FileRecord, bytes: ArrayBuffer, mime: string, name: string, userId: string) {
   const versionId = newId();
   const key = fileKey(file.id, versionId);
-  const mime = APPS[app].exportMime;
-  await c.env.BUCKET.put(key, bytes, { httpMetadata: { contentType: mime } });
+  await env.BUCKET.put(key, bytes, { httpMetadata: { contentType: mime } });
   const now = Date.now();
-  const name = `${stripExt(file.name)}.${APPS[app].ext}`;
-  await c.env.DB.batch([
-    c.env.DB.prepare(
+  await env.DB.batch([
+    env.DB.prepare(
       "INSERT INTO file_versions (id, file_id, r2_key, size, mime, source, created_by, created_at) VALUES (?, ?, ?, ?, ?, 'google_saveback', ?, ?)",
-    ).bind(versionId, file.id, key, bytes.byteLength, mime, me.id, now),
-    c.env.DB.prepare("UPDATE files SET current_version_id = ?, size = ?, mime = ?, name = ?, updated_at = ?, updated_by = ? WHERE id = ?").bind(
+    ).bind(versionId, file.id, key, bytes.byteLength, mime, userId, now),
+    env.DB.prepare("UPDATE files SET current_version_id = ?, size = ?, mime = ?, name = ?, updated_at = ?, updated_by = ? WHERE id = ?").bind(
       versionId,
       bytes.byteLength,
       mime,
       name,
       now,
-      me.id,
+      userId,
       file.id,
     ),
-    c.env.DB.prepare("UPDATE users SET storage_used = storage_used + ? WHERE id = ?").bind(bytes.byteLength, me.id),
-    // The Google copy now matches the new version, so reopening reuses it.
-    c.env.DB.prepare("UPDATE google_links SET source_version_id = ? WHERE file_id = ? AND user_id = ?").bind(versionId, file.id, me.id),
+    env.DB.prepare("UPDATE users SET storage_used = storage_used + ? WHERE id = ?").bind(bytes.byteLength, userId),
+    env.DB.prepare("UPDATE google_links SET source_version_id = ? WHERE file_id = ? AND user_id = ?").bind(versionId, file.id, userId),
   ]);
-  await touchRecent(c.env, me.id, file.id, "modified");
-  if (file.owner_id !== me.id) {
-    await notify(c.env, { userId: file.owner_id, type: "google_saved", actorId: me.id, fileId: file.id });
+  await touchRecent(env, userId, file.id, "modified");
+  if (file.owner_id !== userId) await notify(env, { userId: file.owner_id, type: "google_saved", actorId: userId, fileId: file.id });
+  return file.id;
+}
+
+/**
+ * Save a Doc converted from a PDF as a new file next to the PDF (or in My Files if the saver can't write there),
+ * linked to the same Google Doc so later saves and "Open with" on the new file use it.
+ */
+async function createFromGoogle(
+  env: Env,
+  source: FileRecord,
+  bytes: ArrayBuffer,
+  mime: string,
+  name: string,
+  userId: string,
+  link: { google_file_id: string; google_mime: string },
+) {
+  let parentId: string | null = null;
+  if (source.parent_id) {
+    const parent = await requireAccess(env, source.parent_id, userId, "viewer").catch(() => null);
+    if (parent && atLeast(parent.role, "editor")) parentId = source.parent_id;
   }
-  return c.json(await fileDTO(c.env, file.id, me.id));
-});
+  const id = newId();
+  const versionId = newId();
+  const key = fileKey(id, versionId);
+  await env.BUCKET.put(key, bytes, { httpMetadata: { contentType: mime } });
+  const webViewLink = await env.DB.prepare("SELECT web_view_link FROM google_links WHERE file_id = ? AND user_id = ?")
+    .bind(source.id, userId)
+    .first<string>("web_view_link");
+  const now = Date.now();
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO files (id, owner_id, parent_id, name, is_folder, mime, size, current_version_id, created_at, updated_at, updated_by)
+       VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)`,
+    ).bind(id, userId, parentId, name, mime, bytes.byteLength, versionId, now, now, userId),
+    env.DB.prepare(
+      "INSERT INTO file_versions (id, file_id, r2_key, size, mime, source, created_by, created_at) VALUES (?, ?, ?, ?, ?, 'google_saveback', ?, ?)",
+    ).bind(versionId, id, key, bytes.byteLength, mime, userId, now),
+    env.DB.prepare("UPDATE users SET storage_used = storage_used + ? WHERE id = ?").bind(bytes.byteLength, userId),
+    env.DB.prepare(
+      `INSERT INTO google_links (file_id, user_id, google_file_id, google_mime, web_view_link, source_version_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(id, userId, link.google_file_id, link.google_mime, webViewLink ?? "", versionId, now),
+  ]);
+  await touchRecent(env, userId, id, "modified");
+  return id;
+}
 
 google.delete("/google", async (c) => {
   const me = c.get("user").id;

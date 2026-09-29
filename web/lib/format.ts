@@ -71,7 +71,7 @@ export const KIND_LABEL: Record<Kind, string> = {
 
 /** Which Google editor can open this file (mirrors the worker's googleAppFor). */
 export function googleApp(name: string): "docs" | "sheets" | "slides" | null {
-  if (/\.(docx?|odt|rtf|txt|html?)$/i.test(name)) return "docs";
+  if (/\.(docx?|odt|rtf|txt|html?|pdf)$/i.test(name)) return "docs";
   if (/\.(xlsx?|xlsm|ods|csv|tsv)$/i.test(name)) return "sheets";
   if (/\.(pptx?|odp)$/i.test(name)) return "slides";
   return null;

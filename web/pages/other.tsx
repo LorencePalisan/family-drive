@@ -5,7 +5,7 @@ import { ArrowLeft, Download, Mail, RotateCcw, X } from "lucide-react";
 import type { DriveFile, FileDetails } from "../lib/types";
 import { api, downloadUrl, publicSource } from "../lib/api";
 import { formatBytes, formatDate } from "../lib/format";
-import { Avatar, Button, FileIcon, IconButton, inputClass, useToast } from "../ui/primitives";
+import { Avatar, Button, FileIcon, IconButton, inputClass, Logo, useToast } from "../ui/primitives";
 import { useDriveUI, useFileActions } from "../ui/DriveUI";
 import { useMe } from "../ui/useMe";
 import { LegalLinks } from "./legal";
@@ -31,10 +31,101 @@ export function FileLinkPage() {
 
 // ---- Manage family (owner only) ----------------------------------------------------------------
 
+type Member = {
+  id: string;
+  email: string;
+  name: string;
+  avatarUrl: string | null;
+  role: string;
+  storageUsed: number;
+  storageQuota: number;
+  customQuota: number | null;
+  createdAt: number;
+};
+
 type FamilyData = {
   invites: { id: string; email: string; expiresAt: number; createdAt: number }[];
-  members: { id: string; email: string; name: string; avatarUrl: string | null; role: string; storageUsed: number; createdAt: number }[];
+  members: Member[];
+  defaultQuota: number;
 };
+
+const GB = 1024 ** 3;
+const QUOTA_PRESETS = [15, 50, 100, 250, 500, 1024, 2048, 5120].map((g) => g * GB);
+
+/** Usage bar plus a storage limit picker (the owner raises or lowers each person's limit). */
+function MemberStorage({ m, defaultQuota, onChange }: { m: Member; defaultQuota: number; onChange: (quotaBytes: number | null) => void }) {
+  const [custom, setCustom] = useState(false);
+  const [gb, setGb] = useState("");
+  const pct = Math.min(100, (m.storageUsed / m.storageQuota) * 100);
+  const value = m.customQuota === null ? "default" : String(m.customQuota);
+  const options = m.customQuota !== null && !QUOTA_PRESETS.includes(m.customQuota) ? [...QUOTA_PRESETS, m.customQuota].sort((a, b) => a - b) : QUOTA_PRESETS;
+
+  return (
+    <div className="flex w-full flex-col gap-1.5 sm:w-56">
+      <div className="h-1 overflow-hidden rounded-full bg-surface-3">
+        <div
+          className={pct >= 95 ? "h-full rounded-full bg-danger" : pct >= 80 ? "h-full rounded-full bg-warning" : "h-full rounded-full bg-primary"}
+          style={{ width: `${Math.max(pct, 1)}%` }}
+        />
+      </div>
+      <span className="tabular text-xs text-fg-2">
+        {formatBytes(m.storageUsed)} of {formatBytes(m.storageQuota)} used
+        {m.storageUsed > m.storageQuota && <span className="text-danger"> · over limit, uploads paused</span>}
+      </span>
+      {custom ? (
+        <form
+          className="flex gap-1.5"
+          onSubmit={(e) => {
+            e.preventDefault();
+            onChange(Math.round(Number(gb) * GB));
+            setCustom(false);
+          }}
+        >
+          <input
+            type="number"
+            min={1}
+            max={102400}
+            step="any"
+            required
+            autoFocus
+            value={gb}
+            onChange={(e) => setGb(e.target.value)}
+            className="h-9 w-full min-w-0 rounded border border-line bg-surface px-2 text-sm"
+            aria-label={`Storage limit for ${m.name} in GB`}
+            placeholder="GB"
+          />
+          <Button variant="tonal" type="submit" className="h-9 shrink-0">
+            Save
+          </Button>
+          <IconButton label="Cancel" type="button" onClick={() => setCustom(false)}>
+            <X size={16} />
+          </IconButton>
+        </form>
+      ) : (
+        <select
+          className="h-9 rounded border border-line bg-surface px-2 text-sm text-fg"
+          value={value}
+          aria-label={`Storage limit for ${m.name}`}
+          onChange={(e) => {
+            const v = e.target.value;
+            if (v === "custom") {
+              setGb(String(Math.round(m.storageQuota / GB)));
+              setCustom(true);
+            } else onChange(v === "default" ? null : Number(v));
+          }}
+        >
+          <option value="default">Default ({formatBytes(defaultQuota)})</option>
+          {options.map((b) => (
+            <option key={b} value={String(b)}>
+              {formatBytes(b)}
+            </option>
+          ))}
+          <option value="custom">Custom…</option>
+        </select>
+      )}
+    </div>
+  );
+}
 
 export function FamilyPage() {
   const me = useMe().data;
@@ -56,6 +147,7 @@ export function FamilyPage() {
       setBusy(false);
       qc.invalidateQueries({ queryKey: ["family"] });
       qc.invalidateQueries({ queryKey: ["users"] });
+      qc.invalidateQueries({ queryKey: ["me"] });
     }
   };
 
@@ -111,7 +203,7 @@ export function FamilyPage() {
         <h2 className="mb-2 text-lg">Family members</h2>
         <ul className="divide-y divide-line rounded-2xl border border-line">
           {q.data?.members.map((m) => (
-            <li key={m.id} className="flex items-center gap-3 px-4 py-3">
+            <li key={m.id} className="flex flex-wrap items-center gap-3 px-4 py-3">
               <Avatar name={m.name} src={m.avatarUrl} size={36} />
               <span className="min-w-0 flex-1 text-sm">
                 <span className="block truncate">
@@ -119,7 +211,16 @@ export function FamilyPage() {
                 </span>
                 <span className="block truncate text-fg-2">{m.email}</span>
               </span>
-              <span className="text-sm text-fg-2">{formatBytes(m.storageUsed)}</span>
+              <MemberStorage
+                m={m}
+                defaultQuota={q.data!.defaultQuota}
+                onChange={(quotaBytes) =>
+                  run(
+                    () => api(`/invites/members/${m.id}/quota`, { method: "PUT", body: { quotaBytes } }),
+                    `${m.name}'s storage limit is now ${formatBytes(quotaBytes ?? q.data!.defaultQuota)}`,
+                  )
+                }
+              />
             </li>
           ))}
         </ul>
@@ -148,7 +249,7 @@ export function LoginPage() {
       <div aria-hidden className="pointer-events-none absolute -top-40 -left-32 size-[520px] rounded-full bg-[#0f766e] opacity-[0.14] blur-3xl" />
       <div aria-hidden className="pointer-events-none absolute -right-40 -bottom-48 size-[560px] rounded-full bg-[#e0a458] opacity-[0.10] blur-3xl" />
       <div className="animate-rise relative w-full max-w-md rounded-[28px] bg-surface p-10 text-center shadow-3">
-        <img src="/favicon.svg" alt="Family Drive logo" className="mx-auto mb-4 size-14" />
+        <Logo label="Family Drive logo" className="mx-auto mb-4 size-14" />
         <h1 className="mb-2 text-[32px] leading-tight font-normal">Family Drive</h1>
         <p className="mb-8 text-fg-2">Our photos, videos and documents in one place.</p>
         {error && (
@@ -217,7 +318,7 @@ export function PublicSharePage() {
   if (q.isError) {
     return (
       <div className="flex min-h-full flex-col items-center justify-center gap-3 p-8 text-center">
-        <img src="/favicon.svg" alt="" className="size-12" />
+        <Logo className="size-12" />
         <h1 className="text-2xl">{(q.error as Error).message}</h1>
         <p className="text-fg-2">Ask the person who shared it for a new link.</p>
       </div>
@@ -236,7 +337,7 @@ export function PublicSharePage() {
   return (
     <div className="min-h-full bg-bg">
       <header className="flex h-16 items-center gap-3 px-4">
-        <img src="/favicon.svg" alt="" className="size-9" />
+        <Logo className="size-9" />
         {trail.length > 0 && (
           <IconButton label="Back" onClick={() => setTrail((t) => t.slice(0, -1))}>
             <ArrowLeft size={20} />

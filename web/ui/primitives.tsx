@@ -19,6 +19,24 @@ const KIND_ICON: Record<Kind, { Icon: typeof File; color: string }> = {
   file: { Icon: File, color: "var(--text-2)" },
 };
 
+/** The Family Drive mark, drawn inline so it follows the light/dark theme. */
+export function Logo({ className, label }: { className?: string; label?: string }) {
+  return (
+    <svg viewBox="38 14 224 224" className={className} role={label ? "img" : undefined} aria-label={label} aria-hidden={label ? undefined : true}>
+      <path fill="var(--logo-accent)" d="M202 116 212 108C232 118 239 134 239 150 239 176 227 194 205 194H186C198 194 202 188 202 176Z" />
+      <path
+        fill="none"
+        stroke="var(--logo-ink)"
+        strokeWidth="19"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M52 131 150 50l62 51c22 8 35 27 35 49 0 29-18 52-44 52H100c-10 0-16-6-16-16V68"
+      />
+      <path fill="var(--logo-ink)" d="M115 131c0-4 3-6 6-6h17l6 6h26c4 0 6 3 6 6v22c0 4-2 6-6 6h-49c-4 0-6-2-6-6z" />
+    </svg>
+  );
+}
+
 export function FileIcon({ file, size = 20, className }: { file: Pick<DriveFile, "isFolder" | "mime" | "name">; size?: number; className?: string }) {
   const { Icon, color } = KIND_ICON[fileKind(file)];
   return <Icon size={size} color={color} fill={file.isFolder ? color : "none"} fillOpacity={file.isFolder ? 1 : 0} className={clsx("shrink-0", className)} />;

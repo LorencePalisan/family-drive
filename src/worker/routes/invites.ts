@@ -4,6 +4,7 @@ import { fail } from "../types";
 import { newId, randomToken, sha256 } from "../lib/crypto";
 import { requireOwner } from "../lib/session";
 import { sendInviteEmail } from "../lib/email";
+import { quotaFor } from "./files";
 
 const INVITE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -26,11 +27,16 @@ invites.get("/", async (c) => {
         WHERE revoked_at IS NULL AND accepted_at IS NULL ORDER BY created_at DESC`,
     ),
     c.env.DB.prepare(
-      `SELECT id, email, name, avatar_url AS avatarUrl, role, storage_used AS storageUsed, created_at AS createdAt
+      `SELECT id, email, name, avatar_url AS avatarUrl, role, storage_used AS storageUsed, storage_quota AS customQuota, created_at AS createdAt
          FROM users ORDER BY created_at`,
     ),
   ]);
-  return c.json({ invites: inv.results, members: members.results });
+  const defaultQuota = quotaFor(c.env, null);
+  return c.json({
+    invites: inv.results,
+    defaultQuota,
+    members: (members.results as { customQuota: number | null }[]).map((m) => ({ ...m, storageQuota: quotaFor(c.env, m.customQuota) })),
+  });
 });
 
 invites.post("/", async (c) => {
@@ -61,6 +67,17 @@ invites.post("/:id/resend", async (c) => {
     .first<{ id: string; email: string }>();
   if (!row) fail(404, "Invite not found");
   return c.json({ emailed: await issue(c.env, row!.id, row!.email, c.get("user")) });
+});
+
+/** Raise or lower someone's storage limit. null puts them back on the default. Lowering below their usage only blocks new uploads. */
+invites.put("/members/:id/quota", async (c) => {
+  const { quotaBytes } = await c.req.json<{ quotaBytes: number | null }>();
+  if (quotaBytes !== null && !(Number.isSafeInteger(quotaBytes) && quotaBytes >= 1024 ** 3 && quotaBytes <= 100 * 1024 ** 4)) {
+    fail(400, "Storage limit must be between 1 GB and 100 TB");
+  }
+  const res = await c.env.DB.prepare("UPDATE users SET storage_quota = ? WHERE id = ?").bind(quotaBytes, c.req.param("id")).run();
+  if (!res.meta.changes) fail(404, "Family member not found");
+  return c.json({ storageQuota: quotaFor(c.env, quotaBytes) });
 });
 
 invites.delete("/:id", async (c) => {
