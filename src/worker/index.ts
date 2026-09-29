@@ -11,6 +11,8 @@ import sharing from "./routes/sharing";
 import invites from "./routes/invites";
 import notifications from "./routes/notifications";
 import google from "./routes/google";
+import gsync from "./routes/gsync";
+import { runSync } from "./lib/gsync";
 
 const app = new Hono<AppEnv>();
 
@@ -42,6 +44,7 @@ api.route("/", files);
 api.route("/", uploads);
 api.route("/", sharing);
 api.route("/", google);
+api.route("/", gsync);
 api.route("/notifications", notifications);
 api.route("/invites", invites);
 app.route("/api", api);
@@ -49,37 +52,44 @@ app.route("/api", api);
 app.all("/api/*", (c) => c.json({ error: "Not found" }, 404));
 
 const DAY = 86_400_000;
+const HOUSEKEEPING_CRON = "0 3 * * *";
 
 export default {
   fetch: app.fetch,
 
-  /** Daily housekeeping: empty old trash, abort abandoned uploads, drop expired sessions. */
-  async scheduled(_event, env) {
-    const now = Date.now();
-    const { results: old } = await env.DB.prepare("SELECT id FROM files WHERE trashed_at IS NOT NULL AND trashed_at < ?")
-      .bind(now - 30 * DAY)
-      .all<{ id: string }>();
-    if (old.length) await purgeFiles(env, old.map((r) => r.id));
-
-    const { results: stale } = await env.DB.prepare("SELECT id, r2_key, r2_upload_id FROM uploads WHERE status = 'pending' AND created_at < ?")
-      .bind(now - 2 * DAY)
-      .all<{ id: string; r2_key: string; r2_upload_id: string }>();
-    for (const u of stale) {
-      await env.BUCKET.resumeMultipartUpload(u.r2_key, u.r2_upload_id).abort().catch(() => {});
-      await env.DB.prepare("UPDATE uploads SET status = 'aborted' WHERE id = ?").bind(u.id).run();
-    }
-
-    await env.DB.batch([
-      env.DB.prepare("DELETE FROM sessions WHERE expires_at < ?").bind(now),
-      env.DB.prepare("DELETE FROM uploads WHERE status <> 'pending' AND created_at < ?").bind(now - 7 * DAY),
-      env.DB.prepare("DELETE FROM notifications WHERE created_at < ?").bind(now - 90 * DAY),
-      // Views only read the newest few hundred recents per person; bulk uploads would otherwise grow this forever.
-      env.DB.prepare(
-        `DELETE FROM recents WHERE (user_id, file_id) IN (
-           SELECT user_id, file_id FROM (SELECT user_id, file_id, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY at DESC) AS rn FROM recents)
-            WHERE rn > 500)`,
-      ),
-    ]);
-    console.log(`cleanup: purged ${old.length} trashed items, aborted ${stale.length} uploads`);
+  async scheduled(event, env) {
+    // Every minute: copy the next batch of Google Drive sync work. Leases in runSync keep overlapping runs apart.
+    if (event.cron !== HOUSEKEEPING_CRON) return runSync(env, { ms: 50_000 });
+    await housekeeping(env);
   },
 } satisfies ExportedHandler<Env>;
+
+/** Daily housekeeping: empty old trash, abort abandoned uploads, drop expired sessions. */
+async function housekeeping(env: Env) {
+  const now = Date.now();
+  const { results: old } = await env.DB.prepare("SELECT id FROM files WHERE trashed_at IS NOT NULL AND trashed_at < ?")
+    .bind(now - 30 * DAY)
+    .all<{ id: string }>();
+  if (old.length) await purgeFiles(env, old.map((r) => r.id));
+
+  const { results: stale } = await env.DB.prepare("SELECT id, r2_key, r2_upload_id FROM uploads WHERE status = 'pending' AND created_at < ?")
+    .bind(now - 2 * DAY)
+    .all<{ id: string; r2_key: string; r2_upload_id: string }>();
+  for (const u of stale) {
+    await env.BUCKET.resumeMultipartUpload(u.r2_key, u.r2_upload_id).abort().catch(() => {});
+    await env.DB.prepare("UPDATE uploads SET status = 'aborted' WHERE id = ?").bind(u.id).run();
+  }
+
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM sessions WHERE expires_at < ?").bind(now),
+    env.DB.prepare("DELETE FROM uploads WHERE status <> 'pending' AND created_at < ?").bind(now - 7 * DAY),
+    env.DB.prepare("DELETE FROM notifications WHERE created_at < ?").bind(now - 90 * DAY),
+    // Views only read the newest few hundred recents per person; bulk uploads would otherwise grow this forever.
+    env.DB.prepare(
+      `DELETE FROM recents WHERE (user_id, file_id) IN (
+         SELECT user_id, file_id FROM (SELECT user_id, file_id, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY at DESC) AS rn FROM recents)
+          WHERE rn > 500)`,
+    ),
+  ]);
+  console.log(`cleanup: purged ${old.length} trashed items, aborted ${stale.length} uploads`);
+}

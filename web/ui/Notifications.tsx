@@ -19,6 +19,8 @@ function describe(n: Notification) {
       return `${who} joined the family drive`;
     case "google_saved":
       return `${who} saved changes to ${what} from Google`;
+    case "gsync_done":
+      return `Finished copying ${n.payload?.count ?? "your"} files from Google Drive into ${what}. New changes will keep syncing.`;
   }
 }
 

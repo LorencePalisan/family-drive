@@ -84,7 +84,7 @@ export const fileVersions = sqliteTable(
     r2Key: text("r2_key").notNull(),
     size: integer("size").notNull(),
     mime: text("mime"),
-    source: text("source", { enum: ["upload", "copy", "google_saveback"] }).notNull(),
+    source: text("source", { enum: ["upload", "copy", "google_saveback", "google_sync"] }).notNull(),
     createdBy: text("created_by").notNull(),
     createdAt: integer("created_at").notNull(),
   },
@@ -156,7 +156,7 @@ export const notifications = sqliteTable(
   {
     id: text("id").primaryKey(),
     userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
-    type: text("type", { enum: ["shared", "invite_accepted", "file_added", "google_saved"] }).notNull(),
+    type: text("type", { enum: ["shared", "invite_accepted", "file_added", "google_saved", "gsync_done"] }).notNull(),
     actorId: text("actor_id"),
     fileId: text("file_id"),
     payload: text("payload"), // JSON
@@ -184,6 +184,62 @@ export const uploads = sqliteTable(
     createdAt: integer("created_at").notNull(),
   },
   (t) => [uniqueIndex("uploads_file_idx").on(t.fileId), index("uploads_status_idx").on(t.status, t.createdAt)],
+);
+
+// Google Drive → Family Drive sync (migration 0004_google_sync.sql).
+export const gsyncSources = sqliteTable(
+  "gsync_sources",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+    googleFolderId: text("google_folder_id").notNull(),
+    name: text("name").notNull(),
+    destFolderId: text("dest_folder_id").notNull(),
+    status: text("status", { enum: ["active", "paused", "error"] }).notNull().default("active"),
+    statusMessage: text("status_message"),
+    firstSyncDoneAt: integer("first_sync_done_at"),
+    lastSyncedAt: integer("last_synced_at"),
+    createdAt: integer("created_at").notNull(),
+  },
+  (t) => [uniqueIndex("gsync_sources_user_folder_idx").on(t.userId, t.googleFolderId)],
+);
+
+export const gsyncUsers = sqliteTable("gsync_users", {
+  userId: text("user_id").primaryKey().references(() => users.id, { onDelete: "cascade" }),
+  changesPageToken: text("changes_page_token"),
+  changesCheckedAt: integer("changes_checked_at").notNull().default(0),
+  lockedUntil: integer("locked_until").notNull().default(0),
+});
+
+export const gsyncItems = sqliteTable(
+  "gsync_items",
+  {
+    userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+    googleId: text("google_id").notNull(),
+    sourceId: text("source_id").notNull().references(() => gsyncSources.id, { onDelete: "cascade" }),
+    kind: text("kind", { enum: ["folder", "file"] }).notNull(),
+    name: text("name").notNull(),
+    googleParentId: text("google_parent_id"),
+    fileId: text("file_id"),
+    googleVersion: text("google_version"),
+    size: integer("size").notNull().default(0),
+    state: text("state", { enum: ["pending", "done", "skipped", "error"] }).notNull().default("pending"),
+    error: text("error"),
+    attempts: integer("attempts").notNull().default(0),
+    retryAt: integer("retry_at").notNull().default(0),
+    pageToken: text("page_token"),
+    mpuId: text("mpu_id"),
+    mpuKey: text("mpu_key"),
+    mpuVersionId: text("mpu_version_id"),
+    mpuParts: text("mpu_parts"),
+    mpuOffset: integer("mpu_offset").notNull().default(0),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.userId, t.googleId] }),
+    index("gsync_items_work_idx").on(t.userId, t.state, t.retryAt),
+    index("gsync_items_source_idx").on(t.sourceId, t.state),
+  ],
 );
 
 export type User = typeof users.$inferSelect;

@@ -3,11 +3,11 @@ import { getSignedCookie, setSignedCookie, deleteCookie } from "hono/cookie";
 import type { AppEnv } from "../types";
 import { newId, randomToken, sha256 } from "../lib/crypto";
 import { createSession, destroySession, loadUser, requireUser } from "../lib/session";
-import { exchangeCode, fetchProfile, googleAuthUrl, saveDriveToken, DRIVE_SCOPE } from "../lib/google";
+import { exchangeCode, fetchProfile, googleAuthUrl, saveDriveToken, DRIVE_READONLY_SCOPE, DRIVE_SCOPE } from "../lib/google";
 import { notify } from "../lib/notify";
 import { quotaFor } from "./files";
 
-type OAuthState = { state: string; returnTo: string; drive: boolean };
+type OAuthState = { state: string; returnTo: string; drive: boolean; sync?: boolean };
 
 const STATE_COOKIE = "oauth_state";
 
@@ -19,18 +19,20 @@ export function safeReturn(value: string | undefined | null): string {
 const auth = new Hono<AppEnv>();
 
 auth.get("/google", async (c) => {
-  const drive = c.req.query("drive") === "1";
+  // sync=1 (Google Drive sync) also asks for read access to the whole Drive, on top of the Open-with scope.
+  const sync = c.req.query("sync") === "1";
+  const drive = sync || c.req.query("drive") === "1";
   const returnTo = safeReturn(c.req.query("return"));
   const state = randomToken(16);
   const current = await loadUser(c);
-  await setSignedCookie(c, STATE_COOKIE, JSON.stringify({ state, returnTo, drive } satisfies OAuthState), c.env.TOKEN_ENC_KEY, {
+  await setSignedCookie(c, STATE_COOKIE, JSON.stringify({ state, returnTo, drive, sync } satisfies OAuthState), c.env.TOKEN_ENC_KEY, {
     httpOnly: true,
     secure: new URL(c.req.url).protocol === "https:",
     sameSite: "Lax",
     path: "/api/auth",
     maxAge: 600,
   });
-  return c.redirect(googleAuthUrl(c.env, { state, drive, loginHint: current?.email ?? c.req.query("hint") }));
+  return c.redirect(googleAuthUrl(c.env, { state, drive, sync, loginHint: current?.email ?? c.req.query("hint") }));
 });
 
 auth.get("/google/callback", async (c) => {
@@ -51,7 +53,8 @@ auth.get("/google/callback", async (c) => {
     const current = await loadUser(c);
     if (!current) return c.redirect("/login");
     if (current.email !== email) return c.redirect(`${saved.returnTo}${saved.returnTo.includes("?") ? "&" : "?"}google_error=account_mismatch`);
-    if (!tokens.refresh_token || !tokens.scope.includes(DRIVE_SCOPE)) {
+    const granted = tokens.scope.split(" ");
+    if (!tokens.refresh_token || !granted.includes(DRIVE_SCOPE) || (saved.sync && !granted.includes(DRIVE_READONLY_SCOPE))) {
       return c.redirect(`${saved.returnTo}${saved.returnTo.includes("?") ? "&" : "?"}google_error=not_granted`);
     }
     await saveDriveToken(c.env, current.id, tokens.refresh_token, tokens.scope);

@@ -10,6 +10,7 @@ import { AppShell } from "./ui/AppShell";
 import { FolderPage, HomePage, MyDrivePage, NotFoundPage, RecentPage, SearchPage, SharedPage, StarredPage, TrashPage } from "./pages/drive";
 import { FamilyPage, FileLinkPage, LoginPage, PublicSharePage } from "./pages/other";
 import { PrivacyPage, TermsPage } from "./pages/legal";
+import { GoogleSyncPage } from "./pages/gsync";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -43,6 +44,7 @@ createRoot(document.getElementById("root")!).render(
                 <Route path="trash" element={<TrashPage />} />
                 <Route path="search" element={<SearchPage />} />
                 <Route path="family" element={<FamilyPage />} />
+                <Route path="google-sync" element={<GoogleSyncPage />} />
                 <Route path="*" element={<NotFoundPage />} />
               </Route>
             </Routes>

@@ -3,7 +3,7 @@ import { NavLink, Outlet, useLocation, useMatch, useNavigate, useSearchParams } 
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { useQueryClient } from "@tanstack/react-query";
 import clsx from "clsx";
-import { Check, ChevronRight, Clock, Cloud, FileUp, FolderPlus, FolderUp, HardDrive, Home, LogOut, Menu, Monitor, Moon, Plus, Search, Star, Sun, SunMoon, Trash2, Users, X, UsersRound, Link2Off } from "lucide-react";
+import { Check, ChevronRight, Clock, Cloud, FileUp, FolderPlus, FolderUp, HardDrive, Home, LogOut, Menu, Monitor, Moon, Plus, RefreshCw, Search, Star, Sun, SunMoon, Trash2, Users, X, UsersRound, Link2Off } from "lucide-react";
 import { api } from "../lib/api";
 import { applyTheme, type Theme } from "../lib/theme";
 import type { Me } from "../lib/types";
@@ -19,7 +19,7 @@ import { LegalLinks } from "../pages/legal";
 
 const GOOGLE_ERRORS: Record<string, string> = {
   account_mismatch: "Use the same Google account you sign in to Family Drive with.",
-  not_granted: "Google Drive access wasn't granted, so the file couldn't be opened.",
+  not_granted: "Google Drive access wasn't granted. Try again and allow every permission on Google's screen.",
 };
 
 function useUploadTarget() {
@@ -109,6 +109,7 @@ function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
       {link("/starred", Star, "Starred")}
       <div className="h-3" />
       {link("/trash", Trash2, "Trash")}
+      {link("/google-sync", RefreshCw, "Google Drive sync")}
       {me?.role === "owner" && link("/family", UsersRound, "Manage family")}
       <div className="flex h-8 items-center gap-4 pl-4 text-sm">
         <Cloud size={20} /> Storage

@@ -1,6 +1,6 @@
 import { newId } from "./crypto";
 
-export type NotificationType = "shared" | "invite_accepted" | "file_added" | "google_saved";
+export type NotificationType = "shared" | "invite_accepted" | "file_added" | "google_saved" | "gsync_done";
 
 export async function notify(
   env: Env,

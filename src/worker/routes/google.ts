@@ -60,7 +60,8 @@ async function importToGoogle(env: Env, token: string, file: FileRecord, app: Ap
       "x-upload-content-type": mime,
       "x-upload-content-length": String(obj!.size),
     },
-    body: JSON.stringify({ name: stripExt(file.name), mimeType: APPS[app].googleMime }),
+    // Tagged so Google Drive sync never copies our own "Open with" copies back into Family Drive.
+    body: JSON.stringify({ name: stripExt(file.name), mimeType: APPS[app].googleMime, appProperties: { familyDrive: "1" } }),
   });
   const location = session.headers.get("location");
   if (!location) throw new Error("Google did not return an upload session");
@@ -288,7 +289,14 @@ google.delete("/google", async (c) => {
   const me = c.get("user").id;
   const token = await driveAccessToken(c.env, me);
   if (token) await fetch(`https://oauth2.googleapis.com/revoke?token=${token}`, { method: "POST" }).catch(() => {});
-  await c.env.DB.prepare("DELETE FROM google_tokens WHERE user_id = ?").bind(me).run();
+  await c.env.DB.batch([
+    c.env.DB.prepare("DELETE FROM google_tokens WHERE user_id = ?").bind(me),
+    // Sync can't run without access; Resume after reconnecting picks up where it left off.
+    c.env.DB.prepare("UPDATE gsync_sources SET status = 'error', status_message = ? WHERE user_id = ? AND status <> 'paused'").bind(
+      "Google Drive was disconnected. Reconnect, then press Resume.",
+      me,
+    ),
+  ]);
   return c.json({ ok: true });
 });
 

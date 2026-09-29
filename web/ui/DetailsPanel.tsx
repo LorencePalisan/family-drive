@@ -15,7 +15,12 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
   );
 }
 
-const SOURCE_LABEL: Record<string, string> = { upload: "Uploaded", copy: "Copied", google_saveback: "Saved from Google" };
+const SOURCE_LABEL: Record<string, string> = {
+  upload: "Uploaded",
+  copy: "Copied",
+  google_saveback: "Saved from Google",
+  google_sync: "Synced from Google Drive",
+};
 
 export function DetailsPanel({ id }: { id: string }) {
   const ui = useDriveUI();

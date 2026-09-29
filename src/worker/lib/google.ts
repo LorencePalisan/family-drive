@@ -1,19 +1,21 @@
 import { decrypt, encrypt } from "./crypto";
 
 export const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+/** Read access to the whole Drive, only requested when someone turns on Google Drive sync. */
+export const DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly";
 const BASE_SCOPES = ["openid", "email", "profile"];
 
 export const redirectUri = (env: Env) => `${env.APP_URL}/api/auth/google/callback`;
 
 export function googleAuthUrl(
   env: Env,
-  opts: { state: string; drive: boolean; loginHint?: string },
+  opts: { state: string; drive: boolean; sync?: boolean; loginHint?: string },
 ): string {
   const params = new URLSearchParams({
     client_id: env.GOOGLE_CLIENT_ID,
     redirect_uri: redirectUri(env),
     response_type: "code",
-    scope: [...BASE_SCOPES, ...(opts.drive ? [DRIVE_SCOPE] : [])].join(" "),
+    scope: [...BASE_SCOPES, ...(opts.drive ? [DRIVE_SCOPE] : []), ...(opts.sync ? [DRIVE_READONLY_SCOPE] : [])].join(" "),
     state: opts.state,
     include_granted_scopes: "true",
   });
@@ -75,6 +77,12 @@ export async function saveDriveToken(env: Env, userId: string, refreshToken: str
   )
     .bind(userId, await encrypt(refreshToken, env.TOKEN_ENC_KEY), scopes, Date.now())
     .run();
+}
+
+/** Whether the user's saved Google grant includes a scope (e.g. read access for sync). */
+export async function hasScope(env: Env, userId: string, scope: string) {
+  const row = await env.DB.prepare("SELECT scopes FROM google_tokens WHERE user_id = ?").bind(userId).first<{ scopes: string }>();
+  return !!row && row.scopes.split(" ").includes(scope);
 }
 
 /** Returns a fresh Drive access token for the user, or null if they haven't connected Google Drive. */

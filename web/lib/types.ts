@@ -45,13 +45,13 @@ export interface Me extends Person {
 
 export interface Notification {
   id: string;
-  type: "shared" | "invite_accepted" | "file_added" | "google_saved";
+  type: "shared" | "invite_accepted" | "file_added" | "google_saved" | "gsync_done";
   fileId: string | null;
   fileName: string | null;
   isFolder: boolean;
   actorName: string | null;
   actorAvatar: string | null;
-  payload: { role?: string; message?: string; folderName?: string } | null;
+  payload: { role?: string; message?: string; folderName?: string; count?: number } | null;
   readAt: number | null;
   createdAt: number;
 }
@@ -61,6 +61,24 @@ export interface AccessInfo {
   members: (Person & { role: "viewer" | "editor"; inheritedFrom: string | null })[];
   links: { token: string; url: string; expiresAt: number | null }[];
   canShare: boolean;
+}
+
+export interface SyncSource {
+  id: string;
+  name: string;
+  googleFolderId: string;
+  destFolderId: string;
+  status: "active" | "paused" | "error";
+  statusMessage: string | null;
+  firstSyncDoneAt: number | null;
+  lastSyncedAt: number | null;
+  createdAt: number;
+  filesDone: number;
+  filesPending: number;
+  filesSkipped: number;
+  filesFailed: number;
+  bytesDone: number;
+  foldersPending: number;
 }
 
 /** Where a file's bytes come from: signed-in API or a public share link. */
