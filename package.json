@@ -1,0 +1,44 @@
+{
+  "name": "my-home-media-drive",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "npm run build && vite preview",
+    "deploy": "npm run build && wrangler deploy",
+    "typecheck": "tsc -b",
+    "cf-typegen": "wrangler types",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate:local": "wrangler d1 migrations apply family-drive-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply family-drive-db --remote"
+  },
+  "dependencies": {
+    "@radix-ui/react-context-menu": "^2.3.7",
+    "@radix-ui/react-dialog": "^1.1.23",
+    "@radix-ui/react-dropdown-menu": "^2.1.24",
+    "@tanstack/react-query": "^5.104.0",
+    "client-zip": "^2.5.1",
+    "clsx": "^2.1.1",
+    "drizzle-orm": "^0.45.3",
+    "hono": "^4.13.9",
+    "lucide-react": "^1.48.0",
+    "pdfjs-dist": "^6.3.289",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "react-router": "^8.4.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "^1.61.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^26.6.3",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "drizzle-kit": "^0.31.11",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.1",
+    "wrangler": "^4.142.0"
+  }
+}

@@ -1,0 +1,41 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "my-home-media-drive",
+	"main": "src/worker/index.ts",
+	"compatibility_date": "2026-09-25",
+	"compatibility_flags": ["nodejs_compat"],
+	"assets": {
+		"not_found_handling": "single-page-application",
+		"run_worker_first": ["/api/*", "/invite/*"]
+	},
+	"routes": [{ "pattern": "drive.example.com", "custom_domain": true }],
+	"observability": {
+		"enabled": true
+	},
+	"upload_source_maps": true,
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "family-drive-db",
+			"database_id": "<your-d1-database-id>",
+			"migrations_dir": "migrations"
+		}
+	],
+	"r2_buckets": [{ "binding": "BUCKET", "bucket_name": "family-drive-files" }],
+	"triggers": { "crons": ["0 3 * * *"] },
+	/**
+	 * Non-secret config. Secrets (set with `wrangler secret put`, and in .dev.vars locally):
+	 * GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, TOKEN_ENC_KEY, RESEND_API_KEY
+	 */
+	"vars": {
+		"APP_URL": "https://drive.example.com",
+		"APP_NAME": "Family Drive",
+		"OWNER_EMAIL": "you@example.com",
+		"MAIL_FROM": "drive@example.com",
+		"STORAGE_QUOTA_BYTES": "1099511627776"
+	}
+}

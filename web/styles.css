@@ -1,0 +1,295 @@
+@import "tailwindcss";
+
+/*
+ * Family Drive palette: one teal accent (--primary), greys tinted toward it, shadows tinted with the same hue.
+ * Everything is a CSS variable so light/dark is a variable swap.
+ */
+:root {
+  --bg: #f5f7f6;
+  --surface: #ffffff;
+  --surface-2: #edf1ef;
+  --surface-3: #e3e9e6;
+  --hover: #17221f12;
+  --pressed: #17221f1f;
+  --selected: #cbe8e0;
+  --text: #17221f;
+  --text-2: #43504c;
+  --text-3: #6f7c78;
+  --border: #dde4e1;
+  --primary: #0f766e;
+  --primary-soft: #d2ece6;
+  --on-primary: #ffffff;
+  --danger: #b42318;
+  --warning: #a15c07;
+  --scrim: #0b1f1a66;
+  --skeleton: #e1e8e5;
+  --shadow-1: 0 1px 2px #12332c1f, 0 1px 3px 1px #12332c14;
+  --shadow-2: 0 2px 6px 2px #12332c1f, 0 1px 2px #12332c2e;
+  --shadow-3: 0 8px 28px -6px #12332c38, 0 2px 6px #12332c1a;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161a19;
+    --surface: #101312;
+    --surface-2: #222826;
+    --surface-3: #2c3330;
+    --hover: #e2ebe814;
+    --pressed: #e2ebe824;
+    --selected: #174c43;
+    --text: #e2ebe8;
+    --text-2: #c0cbc7;
+    --text-3: #88948f;
+    --border: #343c39;
+    --primary: #7dd3c0;
+    --primary-soft: #1b4a42;
+    --on-primary: #05302a;
+    --danger: #f5b3ab;
+    --warning: #f5c26b;
+    --scrim: #000000a3;
+    --skeleton: #252b29;
+    --shadow-1: 0 1px 2px #0000004d, 0 1px 3px 1px #00000026;
+    --shadow-2: 0 2px 6px 2px #00000040, 0 1px 2px #0000004d;
+    --shadow-3: 0 10px 30px -6px #00000080, 0 2px 6px #00000040;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #161a19;
+  --surface: #101312;
+  --surface-2: #222826;
+  --surface-3: #2c3330;
+  --hover: #e2ebe814;
+  --pressed: #e2ebe824;
+  --selected: #174c43;
+  --text: #e2ebe8;
+  --text-2: #c0cbc7;
+  --text-3: #88948f;
+  --border: #343c39;
+  --primary: #7dd3c0;
+  --primary-soft: #1b4a42;
+  --on-primary: #05302a;
+  --danger: #f5b3ab;
+  --warning: #f5c26b;
+  --scrim: #000000a3;
+  --skeleton: #252b29;
+  --shadow-1: 0 1px 2px #0000004d, 0 1px 3px 1px #00000026;
+  --shadow-2: 0 2px 6px 2px #00000040, 0 1px 2px #0000004d;
+  --shadow-3: 0 10px 30px -6px #00000080, 0 2px 6px #00000040;
+  color-scheme: dark;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-hover: var(--hover);
+  --color-pressed: var(--pressed);
+  --color-selected: var(--selected);
+  --color-fg: var(--text);
+  --color-fg-2: var(--text-2);
+  --color-fg-3: var(--text-3);
+  --color-line: var(--border);
+  --color-primary: var(--primary);
+  --color-primary-soft: var(--primary-soft);
+  --color-on-primary: var(--on-primary);
+  --color-danger: var(--danger);
+  --color-warning: var(--warning);
+  --shadow-1: var(--shadow-1);
+  --shadow-2: var(--shadow-2);
+  --shadow-3: var(--shadow-3);
+  --font-sans: "Geist", system-ui, -apple-system, "Segoe UI", sans-serif;
+  /* Layering scale: page chrome < panels < overlays < menus < toasts */
+  --z-sticky: 10;
+  --z-header: 20;
+  --z-panel: 30;
+  --z-tray: 40;
+  --z-overlay: 50;
+  --z-menu: 60;
+  --z-toast: 70;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  transition: background-color 200ms ease;
+}
+
+h1,
+h2 {
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+}
+p {
+  text-wrap: pretty;
+}
+
+/* Sizes, dates and counts line up in columns. */
+.tabular,
+td,
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* One icon weight everywhere, a touch lighter than lucide's default. */
+svg.lucide {
+  stroke-width: 1.75;
+}
+
+/*
+ * Interaction states. Unlayered on purpose so they apply even where a utility sets outline-none.
+ * :where() keeps specificity at zero so component classes can still restyle them.
+ */
+:where(button, a, [role="menuitem"], [role="menuitemradio"], [role="option"], summary, tr, [tabindex]) {
+  transition:
+    background-color 180ms cubic-bezier(0.2, 0, 0, 1),
+    color 180ms cubic-bezier(0.2, 0, 0, 1),
+    box-shadow 200ms cubic-bezier(0.2, 0, 0, 1),
+    transform 120ms cubic-bezier(0.2, 0, 0, 1),
+    opacity 180ms ease;
+}
+:where(button:not(:disabled)):active {
+  transform: scale(0.97);
+}
+:where(button, a, input, select, textarea, summary, [tabindex], [role="menuitem"], [role="menuitemradio"]):focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+:where(tr, [role="menuitem"], [role="menuitemradio"]):focus-visible {
+  outline-offset: -2px;
+}
+
+.skip-link {
+  position: fixed;
+  top: 8px;
+  left: 8px;
+  z-index: var(--z-toast);
+  padding: 10px 16px;
+  border-radius: 8px;
+  background: var(--primary);
+  color: var(--on-primary);
+  font-size: 14px;
+  transform: translateY(-160%);
+}
+.skip-link:focus-visible {
+  transform: none;
+}
+
+/* Radix menus */
+.menu {
+  min-width: 228px;
+  background: var(--surface-2);
+  border-radius: 12px;
+  padding: 6px;
+  box-shadow: var(--shadow-3);
+  z-index: var(--z-menu);
+  font-size: 14px;
+  color: var(--text);
+  transform-origin: var(--radix-dropdown-menu-content-transform-origin, var(--radix-context-menu-content-transform-origin, top left));
+}
+.menu[data-state="open"] {
+  animation: menu-in 140ms cubic-bezier(0.2, 0, 0, 1);
+}
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  height: 36px;
+  padding: 0 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  outline: none;
+  user-select: none;
+}
+.menu-item[data-highlighted] {
+  background: var(--hover);
+}
+.menu-item:active {
+  background: var(--pressed);
+}
+.menu-item[data-disabled] {
+  opacity: 0.38;
+  pointer-events: none;
+}
+.menu-item svg {
+  width: 20px;
+  height: 20px;
+  color: var(--text-2);
+  flex-shrink: 0;
+}
+.menu-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 6px 4px;
+}
+
+.scrollbar-thin {
+  scrollbar-width: thin;
+}
+
+/* Skeleton loaders shaped like the content they stand in for. */
+.skeleton {
+  background: linear-gradient(90deg, var(--skeleton) 0%, var(--surface-3) 50%, var(--skeleton) 100%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+  border-radius: 6px;
+}
+
+@keyframes shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -100% 0;
+  }
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes menu-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(-4px);
+  }
+}
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+.animate-fade {
+  animation: fade-in 140ms ease-out;
+}
+.animate-rise {
+  animation: rise-in 220ms cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+.theme-switching,
+.theme-switching * {
+  transition: none !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}
