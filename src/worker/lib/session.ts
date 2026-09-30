@@ -9,12 +9,18 @@ const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 const secure = (c: Context) => new URL(c.req.url).protocol === "https:";
 
-export async function createSession(c: Context<AppEnv>, userId: string) {
+/** Store a new session and return its raw token (only the hash is kept). */
+export async function issueSessionToken(env: Env, userId: string, ttlMs = SESSION_TTL_MS): Promise<string> {
   const token = randomToken();
   const now = Date.now();
-  await c.env.DB.prepare("INSERT INTO sessions (id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)")
-    .bind(await sha256(token), userId, now + SESSION_TTL_MS, now)
+  await env.DB.prepare("INSERT INTO sessions (id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)")
+    .bind(await sha256(token), userId, now + ttlMs, now)
     .run();
+  return token;
+}
+
+export async function createSession(c: Context<AppEnv>, userId: string) {
+  const token = await issueSessionToken(c.env, userId);
   setCookie(c, COOKIE, token, {
     httpOnly: true,
     secure: secure(c),
@@ -24,14 +30,21 @@ export async function createSession(c: Context<AppEnv>, userId: string) {
   });
 }
 
+/** The mobile app sends `Authorization: Bearer <token>`; the web app sends the `sid` cookie. */
+function sessionToken(c: Context<AppEnv>): string | undefined {
+  const auth = c.req.header("authorization");
+  if (auth?.startsWith("Bearer ")) return auth.slice(7).trim() || undefined;
+  return getCookie(c, COOKIE);
+}
+
 export async function destroySession(c: Context<AppEnv>) {
-  const token = getCookie(c, COOKIE);
+  const token = sessionToken(c);
   if (token) await c.env.DB.prepare("DELETE FROM sessions WHERE id = ?").bind(await sha256(token)).run();
   deleteCookie(c, COOKIE, { path: "/" });
 }
 
 export async function loadUser(c: Context<AppEnv>): Promise<User | null> {
-  const token = getCookie(c, COOKIE);
+  const token = sessionToken(c);
   if (!token) return null;
   const row = await c.env.DB.prepare(
     `SELECT u.id, u.email, u.name, u.avatar_url AS avatarUrl, u.role, u.storage_used AS storageUsed, u.storage_quota AS storageQuota, u.theme, u.created_at AS createdAt

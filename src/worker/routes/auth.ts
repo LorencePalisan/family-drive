@@ -2,8 +2,8 @@ import { Hono } from "hono";
 import { getSignedCookie, setSignedCookie, deleteCookie } from "hono/cookie";
 import type { AppEnv } from "../types";
 import { newId, randomToken, sha256 } from "../lib/crypto";
-import { createSession, destroySession, loadUser, requireUser } from "../lib/session";
-import { exchangeCode, fetchProfile, googleAuthUrl, saveDriveToken, DRIVE_SCOPE } from "../lib/google";
+import { createSession, destroySession, issueSessionToken, loadUser, requireUser } from "../lib/session";
+import { exchangeCode, fetchProfile, googleAuthUrl, saveDriveToken, verifyIdToken, DRIVE_SCOPE, type GoogleProfile } from "../lib/google";
 import { notify } from "../lib/notify";
 import { quotaFor } from "./files";
 
@@ -14,6 +14,45 @@ const STATE_COOKIE = "oauth_state";
 /** Only allow same-site relative redirects. */
 export function safeReturn(value: string | undefined | null): string {
   return value && value.startsWith("/") && !value.startsWith("//") ? value : "/";
+}
+
+/**
+ * Find or create the user for a verified Google profile. New accounts need a pending invite (or the owner's email).
+ * Returns null when the person isn't invited.
+ */
+async function signInProfile(env: Env, profile: GoogleProfile): Promise<string | null> {
+  const email = profile.email.toLowerCase();
+  const now = Date.now();
+  let user = await env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(email).first<{ id: string }>();
+  if (!user) {
+    const isOwner = email === env.OWNER_EMAIL.toLowerCase();
+    const invite = isOwner
+      ? null
+      : await env.DB.prepare(
+          `SELECT id, invited_by FROM invites
+            WHERE email = ? AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > ?
+            ORDER BY created_at DESC LIMIT 1`,
+        )
+          .bind(email, now)
+          .first<{ id: string; invited_by: string }>();
+    if (!isOwner && !invite) return null;
+
+    user = { id: newId() };
+    await env.DB.prepare(
+      "INSERT INTO users (id, email, name, avatar_url, role, storage_used, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)",
+    )
+      .bind(user.id, email, profile.name ?? email.split("@")[0], profile.picture ?? null, isOwner ? "owner" : "member", now)
+      .run();
+    if (invite) {
+      await env.DB.prepare("UPDATE invites SET accepted_at = ? WHERE email = ? AND accepted_at IS NULL").bind(now, email).run();
+      await notify(env, { userId: invite.invited_by, type: "invite_accepted", actorId: user.id });
+    }
+  } else {
+    await env.DB.prepare("UPDATE users SET name = COALESCE(?, name), avatar_url = COALESCE(?, avatar_url) WHERE id = ?")
+      .bind(profile.name ?? null, profile.picture ?? null, user.id)
+      .run();
+  }
+  return user.id;
 }
 
 const auth = new Hono<AppEnv>();
@@ -58,39 +97,25 @@ auth.get("/google/callback", async (c) => {
     return c.redirect(saved.returnTo);
   }
 
-  const now = Date.now();
-  let user = await c.env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(email).first<{ id: string }>();
-  if (!user) {
-    const isOwner = email === c.env.OWNER_EMAIL.toLowerCase();
-    const invite = isOwner
-      ? null
-      : await c.env.DB.prepare(
-          `SELECT id, invited_by FROM invites
-            WHERE email = ? AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > ?
-            ORDER BY created_at DESC LIMIT 1`,
-        )
-          .bind(email, now)
-          .first<{ id: string; invited_by: string }>();
-    if (!isOwner && !invite) return c.redirect(`/login?error=not_invited&email=${encodeURIComponent(email)}`);
-
-    user = { id: newId() };
-    await c.env.DB.prepare(
-      "INSERT INTO users (id, email, name, avatar_url, role, storage_used, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)",
-    )
-      .bind(user.id, email, profile.name ?? email.split("@")[0], profile.picture ?? null, isOwner ? "owner" : "member", now)
-      .run();
-    if (invite) {
-      await c.env.DB.prepare("UPDATE invites SET accepted_at = ? WHERE email = ? AND accepted_at IS NULL").bind(now, email).run();
-      await notify(c.env, { userId: invite.invited_by, type: "invite_accepted", actorId: user.id });
-    }
-  } else {
-    await c.env.DB.prepare("UPDATE users SET name = COALESCE(?, name), avatar_url = COALESCE(?, avatar_url) WHERE id = ?")
-      .bind(profile.name ?? null, profile.picture ?? null, user.id)
-      .run();
-  }
-
-  await createSession(c, user.id);
+  const userId = await signInProfile(c.env, profile);
+  if (!userId) return c.redirect(`/login?error=not_invited&email=${encodeURIComponent(email)}`);
+  await createSession(c, userId);
   return c.redirect(saved.returnTo);
+});
+
+/** Mobile app sessions last longer so camera backup keeps running without frequent sign-ins. */
+const MOBILE_SESSION_TTL_MS = 180 * 24 * 60 * 60 * 1000;
+
+/** Mobile sign-in: the app signs in with Google natively and sends the ID token; we answer with a Bearer token. */
+auth.post("/google/native", async (c) => {
+  const { idToken } = await c.req.json<{ idToken?: string }>().catch(() => ({}) as { idToken?: string });
+  if (!idToken) return c.json({ error: "Missing idToken" }, 400);
+  const profile = await verifyIdToken(c.env, idToken);
+  if (!profile) return c.json({ error: "Google sign-in could not be verified" }, 401);
+  if (!profile.email_verified) return c.json({ error: "Your Google email isn't verified", code: "unverified" }, 403);
+  const userId = await signInProfile(c.env, profile);
+  if (!userId) return c.json({ error: `${profile.email} hasn't been invited to this drive`, code: "not_invited" }, 403);
+  return c.json({ token: await issueSessionToken(c.env, userId, MOBILE_SESSION_TTL_MS) });
 });
 
 auth.post("/logout", async (c) => {

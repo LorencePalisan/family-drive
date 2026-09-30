@@ -1,6 +1,14 @@
 # Family Drive — Mobile App Plan (iOS & Android)
 
-_Drafted 2026-09-29. Status: planning; nothing built yet. **Platform decided: React Native with Expo** (2026-09-29)._
+_Drafted 2026-09-29. **Platform decided: React Native with Expo** (2026-09-29)._
+
+**Status (2026-09-29, branch `react-native-expo`): Android first.** Phase 1 is done and Phase 2 is mostly done; see
+[`mobile/README.md`](../mobile/README.md).
+- Backend: `POST /api/auth/google/native` (verifies the Google ID token, same invite rules as the web) and Bearer-token
+  sessions in `loadUser`. No migration needed.
+- `shared/` holds the types and formatting helpers used by both the web app and the Expo app in `mobile/`. The web app
+  stays in `web/`; the full `apps/` monorepo split was skipped for now so the deploy setup doesn't change.
+- Not yet: sharing with family from the app, the backup sync endpoint, auto-backup, push notifications, share target, iOS.
 
 ## Goal
 

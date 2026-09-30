@@ -68,6 +68,20 @@ export async function fetchProfile(accessToken: string): Promise<GoogleProfile> 
   return res.json();
 }
 
+/**
+ * Verify a Google ID token from the mobile app's native sign-in. Its audience is our web client ID
+ * (the app passes it as `webClientId`). Returns null if the token is invalid, expired or for another app.
+ */
+export async function verifyIdToken(env: Env, idToken: string): Promise<GoogleProfile | null> {
+  const res = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`);
+  if (!res.ok) return null;
+  const t = await res.json<{ aud: string; iss: string; exp: string; email?: string; email_verified?: string; name?: string; picture?: string }>();
+  if (t.aud !== env.GOOGLE_CLIENT_ID) return null;
+  if (t.iss !== "accounts.google.com" && t.iss !== "https://accounts.google.com") return null;
+  if (Number(t.exp) * 1000 < Date.now() || !t.email) return null;
+  return { email: t.email, email_verified: t.email_verified === "true", name: t.name, picture: t.picture };
+}
+
 export async function saveDriveToken(env: Env, userId: string, refreshToken: string, scopes: string) {
   await env.DB.prepare(
     `INSERT INTO google_tokens (user_id, refresh_token_enc, scopes, updated_at) VALUES (?1, ?2, ?3, ?4)
