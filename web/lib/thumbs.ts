@@ -20,6 +20,32 @@ async function imageInfo(file: File): Promise<MediaInfo> {
   }
 }
 
+/** iPhone photos. Safari decodes HEIC itself; Chrome and Firefox can't, so they use libheif (WASM, in a worker), loaded on first use. */
+export const isHeic = (file: { name: string; type?: string | null }) => /^image\/hei[cf]/.test(file.type ?? "") || /\.hei[cf]$/i.test(file.name);
+
+/** A full-size JPEG of a HEIC image for browsers that can't show HEIC; Safari's own decoder is used when it works. */
+export async function heicToDisplayable(blob: Blob): Promise<Blob> {
+  const native = await createImageBitmap(blob).catch(() => null);
+  if (native) {
+    native.close();
+    return blob;
+  }
+  const { heicTo } = await import("heic-to");
+  return heicTo({ blob, type: "image/jpeg", quality: 0.92 });
+}
+
+async function heicInfo(file: File): Promise<MediaInfo> {
+  const bmp = await createImageBitmap(file).catch(async () => {
+    const { heicTo } = await import("heic-to");
+    return heicTo({ blob: file, type: "bitmap" });
+  });
+  try {
+    return { width: bmp.width, height: bmp.height, thumbnail: (await canvasToBlob(bmp, bmp.width, bmp.height)) ?? undefined };
+  } finally {
+    bmp.close();
+  }
+}
+
 function videoInfo(file: File): Promise<MediaInfo> {
   return new Promise((resolve) => {
     const url = URL.createObjectURL(file);
@@ -70,14 +96,53 @@ async function pdfInfo(file: File): Promise<MediaInfo> {
   }
 }
 
-/** Best-effort dimensions/duration and a small webp thumbnail. Never throws. */
-export async function mediaInfo(file: File): Promise<MediaInfo> {
+// Thumbnails decode the full image (a 48 MP photo is ~190 MB of pixels), so only a couple run at once
+// however many files are uploading.
+const MAX_DECODES = 2;
+const DECODE_TIMEOUT = 20_000;
+let decoding = 0;
+const waiting: (() => void)[] = [];
+
+async function limited<T>(fn: () => Promise<T>): Promise<T> {
+  // A finishing decode hands its slot straight to the next waiter, so the count never overshoots.
+  if (decoding >= MAX_DECODES) await new Promise<void>((r) => waiting.push(r));
+  else decoding++;
   try {
-    if (file.type.startsWith("image/") && file.type !== "image/svg+xml") return await imageInfo(file);
-    if (file.type.startsWith("video/")) return await videoInfo(file);
-    if (file.type === "application/pdf" && file.size < 100 * 1024 * 1024) return await pdfInfo(file);
+    return await fn();
+  } finally {
+    const next = waiting.shift();
+    if (next) next();
+    else decoding--;
+  }
+}
+
+function infoFor(file: File): (() => Promise<MediaInfo>) | null {
+  if (isHeic(file)) return () => heicInfo(file);
+  if (file.type.startsWith("image/") && file.type !== "image/svg+xml") return () => imageInfo(file);
+  if (file.type.startsWith("video/")) return () => videoInfo(file);
+  if (file.type === "application/pdf" && file.size < 100 * 1024 * 1024) return () => pdfInfo(file);
+  return null;
+}
+
+const tabVisible = () =>
+  new Promise<void>((resolve) =>
+    document.addEventListener("visibilitychange", function on() {
+      if (document.hidden) return;
+      document.removeEventListener("visibilitychange", on);
+      resolve();
+    }),
+  );
+
+/** Best-effort dimensions/duration and a small webp thumbnail. Never throws, and gives up after 20s. */
+export async function mediaInfo(file: File): Promise<MediaInfo> {
+  const run = infoFor(file);
+  if (!run) return {};
+  // Chrome doesn't load video in a hidden tab, so a video thumbnail waits until the tab is visible again.
+  if (file.type.startsWith("video/") && document.hidden) await tabVisible();
+  try {
+    return await limited(() => Promise.race([run(), new Promise<MediaInfo>((r) => setTimeout(() => r({}), DECODE_TIMEOUT))]));
   } catch (err) {
     console.warn("thumbnail failed", file.name, err);
+    return {};
   }
-  return {};
 }

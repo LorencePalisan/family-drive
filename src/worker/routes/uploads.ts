@@ -127,7 +127,16 @@ uploads.put("/files/:id/thumbnail", async (c) => {
   if (buf.byteLength > MAX_THUMB_BYTES) fail(413, "Thumbnail too large");
   const key = thumbKey(file.id);
   await c.env.BUCKET.put(key, buf, { httpMetadata: { contentType: type } });
-  await c.env.DB.prepare("UPDATE files SET thumb_key = ? WHERE id = ?").bind(key, file.id).run();
+  // The browser makes the thumbnail after the upload is saved, so dimensions and duration arrive with it.
+  const num = (k: string) => {
+    const v = Number(c.req.query(k));
+    return Number.isFinite(v) && v > 0 ? Math.round(v) : null;
+  };
+  await c.env.DB.prepare(
+    "UPDATE files SET thumb_key = ?, width = COALESCE(?, width), height = COALESCE(?, height), duration = COALESCE(?, duration) WHERE id = ?",
+  )
+    .bind(key, num("width"), num("height"), num("duration"), file.id)
+    .run();
   return c.json({ ok: true });
 });
 

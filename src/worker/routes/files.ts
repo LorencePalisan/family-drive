@@ -7,6 +7,7 @@ import {
   fileDTO,
   isWithin,
   listAccessible,
+  listPage,
   listTrash,
   requireAccess,
   requireWritableFolder,
@@ -85,7 +86,7 @@ files.get("/drive/home", async (c) => {
 
 files.get("/drive/my", async (c) => {
   const me = c.get("user").id;
-  return c.json({ items: await listAccessible(c.env, me, { where: "f.owner_id = ?1 AND f.parent_id IS NULL" }) });
+  return c.json(await listPage(c.env, me, { where: "f.owner_id = ?1 AND f.parent_id IS NULL", cursor: c.req.query("cursor") }));
 });
 
 files.get("/drive/recent", async (c) => {
@@ -137,6 +138,9 @@ files.get("/folders/:id", async (c) => {
   const me = c.get("user").id;
   const { file } = await requireAccess(c.env, c.req.param("id"), me, "viewer");
   if (!file.is_folder) fail(400, "Not a folder");
+  const cursor = c.req.query("cursor");
+  // Later pages only need the next batch of children; the first also carries the folder and its path.
+  if (cursor) return c.json(await listPage(c.env, me, { where: "f.parent_id = ?2", params: [file.id], cursor }));
 
   const { results: chain } = await c.env.DB.prepare(
     `WITH RECURSIVE anc(id, parent_id, name, owner_id, depth) AS (
@@ -162,11 +166,8 @@ files.get("/folders/:id", async (c) => {
   const top = chain[path.length - 1];
   path.unshift({ id: null, name: top && top.owner_id === me && !top.parent_id ? "My Files" : "Shared with me" });
 
-  const [folder, items] = await Promise.all([
-    fileDTO(c.env, file.id, me),
-    listAccessible(c.env, me, { where: "f.parent_id = ?2", params: [file.id] }),
-  ]);
-  return c.json({ folder, path, items });
+  const [folder, page] = await Promise.all([fileDTO(c.env, file.id, me), listPage(c.env, me, { where: "f.parent_id = ?2", params: [file.id] })]);
+  return c.json({ folder, path, ...page });
 });
 
 // ---- Mutations ---------------------------------------------------------------------------------
