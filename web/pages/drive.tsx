@@ -1,5 +1,5 @@
-import { useState, type ReactNode } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { Link, useParams, useSearchParams, useNavigate } from "react-router";
 import clsx from "clsx";
 import { ChevronDown, ChevronRight, Clock, Compass, FolderOpen, HardDrive, Info, MoreVertical, Search, Star, Trash2, Users } from "lucide-react";
@@ -29,6 +29,27 @@ function Empty({ icon, title, body, children }: { icon: ReactNode; title: string
       {children}
     </div>
   );
+}
+
+type Page = { items: DriveFile[]; nextCursor: string | null };
+
+/**
+ * A paged folder listing, fetched to the end in the background so sorting, select-all and preview
+ * navigation see the whole folder. The first page shows as soon as it arrives.
+ */
+function useAllPages<T extends Page>(queryKey: unknown[], path: string) {
+  const q = useInfiniteQuery({
+    queryKey,
+    queryFn: ({ pageParam }) => api<T>(pageParam ? `${path}?cursor=${encodeURIComponent(pageParam)}` : path),
+    initialPageParam: "",
+    getNextPageParam: (last) => last.nextCursor ?? undefined,
+  });
+  const { hasNextPage, isFetchingNextPage, isError, fetchNextPage } = q;
+  useEffect(() => {
+    if (hasNextPage && !isFetchingNextPage && !isError) fetchNextPage();
+  }, [hasNextPage, isFetchingNextPage, isError, fetchNextPage]);
+  const items = useMemo(() => q.data?.pages.flatMap((p) => p.items) ?? [], [q.data]);
+  return { ...q, first: q.data?.pages[0], items };
 }
 
 const listQuery = (path: string) => ({ queryKey: ["drive", path], queryFn: () => api<{ items: DriveFile[] }>(path) });
@@ -104,12 +125,12 @@ export function HomePage() {
 
 export function MyDrivePage() {
   const ui = useDriveUI();
-  const q = useQuery(listQuery("/drive/my"));
+  const q = useAllPages(["drive", "/drive/my"], "/drive/my");
   return (
     <>
       <PageHeader title="My Files" />
       <FileBrowser
-        items={q.data?.items ?? []}
+        items={q.items}
         columns="folder"
         loading={q.isLoading}
         empty={
@@ -125,13 +146,10 @@ export function MyDrivePage() {
 export function FolderPage() {
   const { id } = useParams();
   const ui = useDriveUI();
-  const q = useQuery({
-    queryKey: ["drive", "folder", id],
-    queryFn: () => api<{ folder: DriveFile; path: { id: string | null; name: string }[]; items: DriveFile[] }>(`/folders/${id}`),
-  });
-  if (q.isError) return <Empty icon={<FolderOpen size={56} />} title="Folder not available" body={(q.error as Error).message} />;
-  const path = q.data?.path ?? [];
-  const folder = q.data?.folder;
+  const q = useAllPages<Page & { folder: DriveFile; path: { id: string | null; name: string }[] }>(["drive", "folder", id], `/folders/${id}`);
+  if (q.isError && !q.first) return <Empty icon={<FolderOpen size={56} />} title="Folder not available" body={(q.error as Error).message} />;
+  const path = q.first?.path ?? [];
+  const folder = q.first?.folder;
   const rootHref = path[0]?.name === "My Files" ? "/drive" : "/shared";
 
   return (
@@ -172,7 +190,7 @@ export function FolderPage() {
         }
       />
       <FileBrowser
-        items={q.data?.items ?? []}
+        items={q.items}
         columns="folder"
         loading={q.isLoading}
         empty={

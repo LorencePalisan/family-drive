@@ -21,6 +21,7 @@
     "client-zip": "^2.5.1",
     "clsx": "^2.1.1",
     "drizzle-orm": "^0.45.3",
+    "heic-to": "^1.6.5",
     "hono": "^4.13.9",
     "lucide-react": "^1.48.0",
     "pdfjs-dist": "^6.3.289",

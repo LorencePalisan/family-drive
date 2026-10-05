@@ -1,14 +1,67 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { ArrowLeft, ChevronLeft, ChevronRight, Download, Info, MoreVertical, UserPlus } from "lucide-react";
 import type { DriveFile } from "../lib/types";
 import { api, downloadUrl } from "../lib/api";
 import { fileKind, googleApp } from "../lib/format";
+import { heicToDisplayable, isHeic } from "../lib/thumbs";
 import { Button, FileIcon, IconButton } from "./primitives";
 import { FileDropdown } from "./FileMenu";
 import { useDriveUI, useFileActions, type PreviewState } from "./DriveUI";
 
 const GOOGLE_LABEL = { docs: "Google Docs", sheets: "Google Sheets", slides: "Google Slides" } as const;
+
+// The last few converted HEIC photos, so stepping back and forth between them doesn't decode again.
+const heicCache = new Map<string, Promise<string>>();
+const HEIC_CACHE_SIZE = 6;
+
+function heicUrl(url: string, version: number): Promise<string> {
+  const key = `${url}#${version}`;
+  let p = heicCache.get(key);
+  if (p) {
+    heicCache.delete(key);
+  } else {
+    p = fetch(url)
+      .then((res) => (res.ok ? res.blob() : Promise.reject(new Error(`HTTP ${res.status}`))))
+      .then(heicToDisplayable)
+      .then((b) => URL.createObjectURL(b));
+    p.catch(() => heicCache.delete(key));
+  }
+  heicCache.set(key, p);
+  for (const [k, old] of heicCache) {
+    if (heicCache.size <= HEIC_CACHE_SIZE) break;
+    heicCache.delete(k);
+    old.then(URL.revokeObjectURL, () => {});
+  }
+  return p;
+}
+
+/** Chrome and Firefox can't show HEIC (iPhone photos), so it's converted in the browser; the thumbnail stands in meanwhile. */
+function HeicImage({ state, url, onError }: { state: PreviewState; url: string; onError: () => void }) {
+  const { file, source } = state;
+  const [src, setSrc] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    setSrc(null);
+    heicUrl(url, file.updatedAt).then(
+      (u) => live && setSrc(u),
+      () => live && onError(),
+    );
+    return () => {
+      live = false;
+    };
+  }, [url, file.updatedAt, onError]);
+
+  if (src) return <img key={file.id} src={src} alt={file.name} className="max-h-full max-w-full object-contain" />;
+  return (
+    <div className="relative flex max-h-full max-w-full items-center justify-center">
+      {file.hasThumbnail && <img src={source.thumbnail(file)} alt="" className="max-h-[80vh] max-w-full object-contain opacity-60 blur-sm" />}
+      <span role="status" className="absolute rounded-full bg-black/60 px-4 py-2 text-sm text-[#e3e3e3]">
+        Loading photo…
+      </span>
+    </div>
+  );
+}
 
 function Media({ state }: { state: PreviewState }) {
   const { file, source } = state;
@@ -16,7 +69,11 @@ function Media({ state }: { state: PreviewState }) {
   useEffect(() => setFailed(false), [file.id]);
   const url = source.content(file);
   const kind = fileKind(file);
+  const fail = useCallback(() => setFailed(true), []);
 
+  if (!failed && kind === "image" && isHeic({ name: file.name, type: file.mime })) {
+    return <HeicImage key={file.id} state={state} url={url} onError={fail} />;
+  }
   if (!failed && kind === "image") {
     return <img key={file.id} src={url} alt={file.name} onError={() => setFailed(true)} className="max-h-full max-w-full object-contain" />;
   }

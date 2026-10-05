@@ -109,8 +109,8 @@ export async function isWithin(env: Env, candidateId: string, ancestorId: string
  * of the drive, which is what keeps D1 usage flat as the family's library grows.
  * Yields a(id, rnk, prnk): rnk = best rank (3 = owner-level, 2 = editor, 1 = viewer), prnk = the parent's.
  */
-const accessCte = (where: string) => `
-  WITH RECURSIVE cand(id) AS (SELECT f.id FROM files f WHERE f.trashed_at IS NULL AND (${where})),
+const accessCte = (where: string, candTail = "") => `
+  WITH RECURSIVE cand(id) AS (SELECT f.id FROM files f WHERE f.trashed_at IS NULL AND (${where}) ${candTail}),
   up(fid, id, parent_id, owner_id, depth) AS (
     SELECT f.id, f.id, f.parent_id, f.owner_id, 0 FROM cand JOIN files f ON f.id = cand.id
     UNION ALL
@@ -205,6 +205,53 @@ export async function listAccessible(
     .bind(userId, ...(opts.params ?? []))
     .all<ListRow>();
   return results.map((r) => toDTO(r, userId));
+}
+
+export const PAGE_SIZE = 500;
+
+type Cursor = { f: 0 | 1; n: string; i: string };
+const encodeCursor = (c: Cursor) => btoa(encodeURIComponent(JSON.stringify(c)));
+function decodeCursor(raw: string | undefined): Cursor {
+  if (!raw) return { f: 1, n: "", i: "" };
+  try {
+    const c = JSON.parse(decodeURIComponent(atob(raw))) as Cursor;
+    if ((c.f === 0 || c.f === 1) && typeof c.n === "string" && typeof c.i === "string") return c;
+  } catch {}
+  return fail(400, "Invalid cursor");
+}
+
+/**
+ * One page of a folder-style listing (folders first, then files, by name). Only for `where`s whose matches
+ * are all accessible once the parent is (a folder's children, the user's own root), since the page is cut
+ * before the access check. Keyset-paged within each is_folder group so each page reads ~`size` index
+ * entries (files_list_idx) instead of rescanning the folder.
+ */
+export async function listPage(env: Env, userId: string, opts: { where: string; params?: unknown[]; cursor?: string; size?: number }) {
+  const size = Math.min(opts.size ?? PAGE_SIZE, 1000);
+  let cur = decodeCursor(opts.cursor);
+  const items: FileDTO[] = [];
+  for (;;) {
+    const want = size - items.length;
+    const p = 2 + (opts.params?.length ?? 0);
+    const order = "f.name COLLATE NOCASE, f.id";
+    const sql = `${accessCte(
+      // COLLATE goes on the cursor value: written on f.name, SQLite can't seek the index to the cursor.
+      `(${opts.where}) AND f.is_folder = ?${p} AND (f.name, f.id) > (?${p + 1} COLLATE NOCASE, ?${p + 2})`,
+      `ORDER BY ${order} LIMIT ${want + 1}`,
+    )} SELECT ${LIST_COLUMNS} ${LIST_JOINS} ORDER BY ${order}`;
+    const { results } = await env.DB.prepare(sql)
+      .bind(userId, ...(opts.params ?? []), cur.f, cur.n, cur.i)
+      .all<ListRow>();
+    items.push(...results.slice(0, want).map((r) => toDTO(r, userId)));
+    if (results.length > want) {
+      const last = items[items.length - 1];
+      return { items, nextCursor: encodeCursor({ f: cur.f, n: last.name, i: last.id }) };
+    }
+    if (cur.f === 0) return { items, nextCursor: null };
+    // Folders are exhausted; fill the rest of the page with files.
+    cur = { f: 0, n: "", i: "" };
+    if (items.length === size) return { items, nextCursor: encodeCursor(cur) };
+  }
 }
 
 /** Single-file DTO (after an access check has already passed). */

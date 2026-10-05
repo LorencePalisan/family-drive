@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import clsx from "clsx";
 import { ArrowDown, ArrowUp, Check, Download, FolderInput, LayoutGrid, Link, List, MoreVertical, RotateCcw, Star, Trash2, UserPlus, Users, X } from "lucide-react";
 import type { DriveFile } from "../lib/types";
@@ -11,6 +11,7 @@ import { useDriveUI, useFileActions } from "./DriveUI";
 export type Columns = "folder" | "home" | "recent" | "shared" | "trash" | "search" | "starred";
 type SortKey = "name" | "updatedAt" | "size";
 
+const RENDER_STEP = 200;
 const DRAG_TYPE = "application/x-drive-ids";
 const coarse = typeof matchMedia !== "undefined" && matchMedia("(pointer: coarse)").matches;
 
@@ -131,6 +132,17 @@ export function FileBrowser({
       return next.size === s.size ? s : next;
     });
   }, [items]);
+
+  // Big folders render in steps as you scroll; selection, sorting and preview still use the full list.
+  const [shown, setShown] = useState(RENDER_STEP);
+  const visible = sorted.length > shown ? sorted.slice(0, shown) : sorted;
+  const sentinel = useCallback((el: HTMLDivElement | null) => {
+    if (!el) return;
+    const io = new IntersectionObserver((entries) => entries[0].isIntersecting && setShown((n) => n + RENDER_STEP), { rootMargin: "800px" });
+    io.observe(el);
+    return () => io.disconnect();
+  }, []);
+  const more = visible.length < sorted.length && <div ref={sentinel} className="h-px" />;
 
   const selectedFiles = sorted.filter((f) => selected.has(f.id));
   const filesFor = (f: DriveFile) => (selected.has(f.id) ? selectedFiles : [f]);
@@ -300,8 +312,8 @@ export function FileBrowser({
   );
 
   if (ui.view === "grid") {
-    const folders = sorted.filter((f) => f.isFolder);
-    const files = sorted.filter((f) => !f.isFolder);
+    const folders = visible.filter((f) => f.isFolder);
+    const files = visible.filter((f) => !f.isFolder);
     const tileClass = (f: DriveFile) =>
       clsx(
         "cursor-default rounded-xl outline-none select-none",
@@ -373,6 +385,7 @@ export function FileBrowser({
             </div>
           </>
         )}
+        {more}
       </div>
     );
   }
@@ -440,7 +453,7 @@ export function FileBrowser({
           </tr>
         </thead>
         <tbody>
-          {sorted.map((f) =>
+          {visible.map((f) =>
             rowMenu(
               f,
               <tr
@@ -477,6 +490,7 @@ export function FileBrowser({
           )}
         </tbody>
       </table>
+      {more}
     </div>
   );
 }
